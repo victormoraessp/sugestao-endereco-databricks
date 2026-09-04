@@ -155,8 +155,9 @@ tb_endereco (10 bi)                                      tb_correios (DNE)
  E2  parsing + normalização (Spark nativo)                  E3  normalização + dims por CEP e por logradouro
  E4  validação de cada variante contra o CEP  <---------------------------+
  E5  fuzzy: acha o logradouro nos Correios para quem tem CEP errado/ausente
- E6  clustering dentro do CPF: "quais variantes são o mesmo endereço?"
- E7  eleição por campo dentro de cada cluster  +  E7b consolidação de clusters com a mesma sugestão
+ E6  clustering dentro do CPF, nível 1: "quais variantes são o mesmo local (rua + número)?"  -> grupo_local
+ E6b clustering nível 2: "dentro do local, quais são a mesma unidade (apartamento, bloco, sala...)?" -> cluster
+ E7  eleição por campo dentro de cada cluster  +  E7b consolidação de grupos locais com a mesma sugestão
  E8  LLM só para clusters de baixa confiança (amostra, cache)
  E9  devolve a sugestão para cada linha original + métricas + checks de uniformidade
 ```
@@ -482,6 +483,55 @@ dois, fica sozinha — não dá para saber a qual pertence. As que não se anexa
 > em Python, e não escala. A propagação por janelas usa só o Spark e explora o fato de que os grupos (um CPF) são
 > pequenos.
 
+O resultado de E6 é o **`grupo_local`**: "mesma rua + mesmo número", ou seja, o prédio ou o lote. Ele ainda **não**
+é o endereço — é o assunto da próxima etapa.
+
+### 4.13b E6b — Unidades dentro do mesmo local (apartamentos, blocos, salas, lotes, frente/fundos)
+
+Um cliente pode ter dois ou mais endereços **no mesmo prédio**: `APTO 45` e `APTO 46`, `BLOCO A` e `BLOCO B`,
+`SALA 101` e `SALA 205`, `KM 12` e `KM 15` numa rodovia, a casa da `FRENTE` e a dos `FUNDOS`. Rua, número e CEP
+são iguais; só o complemento distingue. Fundir isso numa sugestão única seria um erro grave: metade das linhas
+receberia o apartamento errado. Por outro lado, o caso mais comum é o oposto — um único apartamento, com o
+complemento faltando em algumas linhas — e aí as linhas sem complemento **devem** receber o complemento.
+
+E6b resolve os dois casos com a noção de **compatibilidade**:
+
+1. Cada variante recebe uma **assinatura**: os pares distintivos de `compl_pares` (`APTO 45`, `BLOCO B`, `KM 12`;
+   palavras de posição viram `POSICAO FUNDOS`/`POSICAO FRENTE`). Zeros à esquerda são removidos (`APTO 045` =
+   `APTO 45`). Texto livre (`PROXIMO AO MERCADO`) não entra: não dá para comparar com segurança.
+2. Duas assinaturas são **compatíveis** quando, para todo tipo de par presente nas duas, o valor é o mesmo.
+   `{APTO 45}` e `{BLOCO B}` são compatíveis (nada em comum contradiz); `{APTO 45}` e `{APTO 46}` **conflitam**.
+3. Dentro de cada `grupo_local`, as assinaturas **maximais** (que não estão contidas em outra) definem as unidades:
+   - se nenhuma maximal conflita com outra, o grupo é **uma** unidade e a assinatura da unidade é a união dos pares
+     (`APTO 45 | BLOCO B`) — cobre "APTO 45 BL B" numa linha, "AP 45" em outra e "BLOCO B" em outra;
+   - se há conflito, as maximais em conflito são **âncoras** (unidades distintas por evidência). Uma assinatura
+     parcial (`{BLOCO B}` quando existem `{APTO 45}` e `{APTO 46}`) só entra numa unidade se for compatível com
+     **exatamente uma**; compatível com duas ⇒ **ambígua**, cluster próprio.
+4. Linhas **sem complemento**: se o grupo tem uma unidade só, entram nela. Se tem duas ou mais, formam um cluster
+   próprio, **sem complemento sugerido**, com a flag `COMPLEMENTO_AMBIGUO`. O processo não chuta em qual
+   apartamento a linha estava — sugere rua, número, CEP, bairro, cidade e UF (que são iguais) e deixa o complemento
+   vazio para revisão (ou para o LLM de E8, se você quiser tentar).
+5. `cluster_id = grupo_local # hash(unidade)`, e a coluna `unidade` mostra os pares que definem o cluster.
+
+Implementação: a assinatura é calculada nativamente; grupos com 0 ou 1 assinatura não vazia (a enorme maioria)
+são resolvidos nativamente; só os grupos com 2+ assinaturas distintas passam por uma pandas UDF que aplica as
+regras acima a uma lista de poucas strings. A célula traz **auto-testes** dessa função (os cenários acima); se um
+falhar, a célula para antes de processar dados.
+
+> **Por que "conflito separa, ausência não separa"?** Porque são evidências diferentes. Duas linhas com `APTO 45`
+> e `APTO 46` são prova de duas unidades. Uma linha sem complemento não é prova de nada: pode ser qualquer uma. A
+> regra copia o raciocínio de um analista: só junta o que não se contradiz, e só preenche o que falta quando há uma
+> única resposta possível.
+
+> **Limite honesto:** `APTO 45` e `APTO 45 BLOCO A` são tratados como a mesma unidade (o segundo só completa o
+> primeiro). Se o cliente tem de fato o apto 45 do bloco A **e** o apto 45 do bloco B, só linhas que citem os dois
+> blocos separam as unidades. É um caso raro e, sem a informação, indecidível.
+
+Teste sintético do cenário: parte dos CPFs sintéticos recebe **duas unidades no mesmo prédio** (mesma rua, número
+e CEP; `APTO n` e `APTO n+1`, às vezes com bloco). A métrica `fusoes_indevidas` (clusters não ambíguos que
+misturam dois endereços verdadeiros) tem de ser **0**, e `pct_linhas_complemento_ambiguo` mostra quantas linhas
+ficaram sem complemento por serem indecidíveis.
+
 ### 4.14 E7 — Eleição por campo
 
 Para cada cluster, elege **campo a campo** (não "a melhor linha inteira"):
@@ -521,17 +571,47 @@ Depois da primeira eleição, pode existir o mesmo endereço em dois clusters do
 comum: erro de digitação + CEP aleatório, por exemplo). Se ficasse assim, as linhas de um cluster teriam uma
 sugestão e as do outro, outra — exatamente o que não pode acontecer.
 
-E7b resolve: aplica a **mesma propagação de rótulo** agora sobre os clusters, usando a **sugestão eleita** como
-chave (`CEP+número` para CEPs de logradouro, `rua+número+cidade`, `fonética+número+cidade`, e as versões sem
-número). Clusters que caem no mesmo grupo são fundidos e **reeleitos juntos** (flag `CLUSTER_CONSOLIDADO`). Só os
-clusters afetados são reeleitos; os demais mantêm a 1ª eleição. O mapa linha → cluster consolidado vai para
+E7b resolve: aplica a **mesma propagação de rótulo** agora sobre os grupos locais, usando a **sugestão eleita**
+como chave (`CEP+número` para CEPs de logradouro, `rua+número+cidade`, `fonética+número+cidade`, e as versões sem
+número; a chave `GL` amarra todas as unidades de um grupo para se moverem juntas). Grupos que caem no mesmo rótulo
+são fundidos, a divisão por unidade (E6b) é **refeita** no grupo fundido — apartamentos distintos continuam
+separados — e os clusters resultantes são **reeleitos** (flag `CLUSTER_CONSOLIDADO`). Só os grupos afetados são
+reprocessados; os demais mantêm a 1ª eleição. O mapa linha → cluster consolidado vai para
 `_05b_clusters_consolidados`, que é o que E9 usa.
 
-Resultado: **um endereço sugerido ⇒ um `cluster_id` ⇒ uma única sugestão em todas as suas linhas.**
+Resultado: **um endereço sugerido (local + unidade) ⇒ um `cluster_id` ⇒ uma única sugestão em todas as suas
+linhas.**
 
 No teste com todas as chaves ligadas, E7b não precisou fundir nada. Desligando cinco das sete chaves de E6 de
 propósito (`CHAVES_CLUSTER_DESATIVADAS`), E6 fragmentou em 424 clusters, E7b fundiu 45 e os checks de E9 ficaram em
 zero.
+
+### 4.15b Grau de certeza — o que aplicar sozinho e o que mandar para gente
+
+O `score_confianca_sugestao` (0–100) é contínuo e serve para ordenar. Para **decidir** (aplicar automaticamente,
+conferir por amostragem, ou mandar para um time humano) é melhor uma escala pequena e explicável. Cada linha da
+saída recebe `grau_certeza`, `requer_revisao_humana` (booleano) e `motivos_revisao` (lista de razões):
+
+| Grau | Quando | Uso sugerido |
+|---|---|---|
+| `A_ALTA` | score ≥ 85, CEP respaldado pelos Correios e **nenhuma** restrição abaixo | aplicar automaticamente |
+| `B_MEDIA` | score ≥ 65, ou rebaixado por: o cliente tem 2+ unidades no mesmo prédio (`MULTIPLAS_UNIDADES_NO_LOCAL`), endereço sem número (`SEM_NUMERO`), número desta linha preenchido a partir do cluster porque a linha era S/N (`NUMERO_PREENCHIDO_PELO_CLUSTER`), consenso interno forte sem Correios, LLM aplicado | aplicar com amostragem de conferência |
+| `C_BAIXA` | score < 65, ou rebaixado por: CEP sem validação nos Correios, CEP ausente, conflito de número entre as variantes, variante única sem Correios, consenso interno fraco, LLM consultado com baixa confiança | não usar em processos críticos; fila de baixa prioridade |
+| `D_REVISAO_HUMANA` | condição crítica no cluster: complemento ambíguo, fuzzy ambíguo sem CEP validado, CEP que contradiz o endereço, concordância muito baixa de logradouro/número, sem sugestão — **ou** na linha: a sugestão troca o **número** desta linha, troca o **logradouro** sem respaldo (Correios/LLM), troca o **CEP** por outro não validado | revisão humana obrigatória |
+
+Como funciona: o cluster começa no grau dado pelo score; cada regra de restrição impõe um **nível mínimo** (no
+máximo B, no máximo C, ou D) e grava o motivo; o pior nível vence. Isso é feito em E7 (e refeito em E8 se o LLM
+sobrescreveu). Em E9, três regras **por linha** podem rebaixar mais: elas comparam o que *aquela* linha dizia com a
+sugestão — uma linha que tinha o número 123 e recebe 132 é um caso para gente olhar, mesmo que o cluster seja
+confiável. Os limiares ficam em `LIMIAR_GRAU_ALTA` / `LIMIAR_GRAU_MEDIA`; as regras estão numa lista simples
+dentro de `grau_certeza_cluster` e `regras_linha`, fáceis de estender.
+
+> **Por que uma escala por regras e não só o score?** Porque um número esconde o *motivo*. "Score 72" não diz se o
+> problema é um CEP não validado (tolerável) ou um número trocado (crítico). Regras nomeadas produzem uma fila de
+> revisão que o time consegue priorizar por motivo, e permitem ajustar a política sem retreinar nada.
+
+> **Por que "o pior vence"?** Porque, para revisão humana, o custo de um falso positivo (mandar para revisão algo
+> que estava certo) é pequeno, e o custo de um falso negativo (aplicar automaticamente um endereço errado) é alto.
 
 ### 4.16 E8 — Fallback com LLM
 
@@ -560,9 +640,9 @@ cidade, UF, CEP, confiança 0–1, justificativa).
 1. Relê a origem com **o mesmo escopo** de E1 e recalcula `hash_linha`.
 2. Join com `_05b_clusters_consolidados` (linha → cluster) e com a sugestão por cluster.
 3. Devolve as colunas originais **com os nomes originais**, as `<coluna>_sugestao` (também com os nomes
-   originais + sufixo), `endereco_sugestao_completo`, `cluster_id`, contagens, `metodo_sugestao`,
-   `score_confianca_sugestao`, `concordancias`, `flags_sugestao` e `flag_alterou_<campo>` (compara cada original
-   normalizado com a sugestão).
+   originais + sufixo), `endereco_sugestao_completo`, `cluster_id`, `unidade`, `n_unidades_local`, contagens,
+   `metodo_sugestao`, `score_confianca_sugestao`, `grau_certeza`, `requer_revisao_humana`, `motivos_revisao`,
+   `concordancias`, `flags_sugestao` e `flag_alterou_<campo>` (compara cada original normalizado com a sugestão).
 4. Grava `<prefixo>_final` (overwrite no lote 0, append nos demais, `CLUSTER BY idCPF`) e uma linha em
    `<prefixo>_metricas` com contagens, distribuição por método, % de linhas alteradas por campo e os
    **checks de uniformidade**:
@@ -586,8 +666,11 @@ Vale repetir, porque é o requisito mais importante:
 2. Logo, dentro de um cluster, as colunas `_sugestao` são idênticas por construção. Só as `flag_alterou_*` mudam
    por linha (comparam cada original com a sugestão).
 3. A única brecha seria o mesmo endereço em dois clusters. Contra isso: as 7 chaves de E6, a anexação das
-   variantes sem número, a consolidação E7b (mesmo endereço sugerido ⇒ mesmo cluster) e os dois checks medidos em
-   E9 e gravados em `_metricas`.
+   variantes sem número, a consolidação E7b (mesmo local sugerido ⇒ mesmo grupo, com as unidades refeitas) e os
+   dois checks medidos em E9 e gravados em `_metricas`.
+3b. O erro inverso — **fundir dois endereços diferentes** (dois apartamentos no mesmo prédio) — é evitado por E6b:
+   complementos conflitantes nunca ficam no mesmo cluster, e linhas indecidíveis ficam marcadas em vez de
+   receberem um complemento chutado.
 4. Limite honesto: uma variante tão distorcida que nenhuma chave nem o fuzzy alcançam fica num cluster próprio,
    com score baixo — é o caso que o LLM de E8 foi desenhado para resolver, e que aparece na auditoria como
    `VARIANTE_UNICA` com score < 60.
@@ -601,11 +684,19 @@ Não havia acesso à base real nem a um cluster Databricks durante o desenvolvim
 1. Ambiente local com PySpark 4.1.3 (mesma linha do DBR 18) e Java 17.
 2. As células foram executadas em sequência por um script, exatamente como no notebook, com
    `MODO_TESTE_SINTETICO=True` (300 CPFs, ~5.400 linhas, ~360 endereços verdadeiros, todas as patologias).
-3. Resultados: pureza dos clusters 100 %, completude ≈ 100 %, acerto de CEP, logradouro, bairro, cidade e UF
-   ≈ 100 %, número ≥ 99 %. Com recência (`COL_DATA`) e com o provedor `mock` do LLM: mesmo comportamento, 40
-   clusters sobrescritos pelo "LLM" com a flag `LLM_APLICADO`.
-4. Teste de robustez de E7b: com 5 chaves de E6 desligadas, 45 clusters fragmentados foram fundidos e os checks de
-   uniformidade ficaram em 0.
+3. Resultados (versão final, com 66 CPFs tendo dois apartamentos no mesmo prédio): fusões indevidas entre linhas
+   numeradas 0; pureza dos clusters 99,8 %; completude excluindo linhas ambíguas 99,3 %; acerto de CEP, logradouro,
+   bairro, cidade e UF 100 %, número 99,7 %, complemento nas linhas não ambíguas 100 %; 8,5 % das linhas ficaram
+   `COMPLEMENTO_AMBIGUO`. Distribuição do grau de certeza: cerca de 62 % `A_ALTA`, 29 % `B_MEDIA` (quase tudo por
+   "prédio com 2+ unidades" e "número preenchido a partir do cluster", proporções exageradas no sintético), 8,5 %
+   `D_REVISAO_HUMANA` (as linhas ambíguas). Com
+   recência (`COL_DATA`) e com o provedor `mock` do LLM: mesmo comportamento, clusters sobrescritos pelo "LLM" com a
+   flag `LLM_APLICADO`.
+4. Teste de robustez de E7b: com 5 das 7 chaves de E6 desligadas, 63 grupos fragmentados foram fundidos, as
+   unidades refeitas e os checks de uniformidade ficaram em 0.
+5. O único "erro" residual encontrado é uma linha `S/N` de um endereço anexada ao cluster numerado de **outro**
+   endereço do mesmo cliente na mesma rua (o gerador sorteou a mesma rua duas vezes). É a inferência documentada
+   da anexação de S/N; por isso a linha recebe `NUMERO_PREENCHIDO_PELO_CLUSTER` e no máximo `B_MEDIA`.
 
 O que **não** foi testado e merece atenção na primeira execução real: escrita Delta com `CLUSTER BY` (o ambiente
 local não tem Delta), widgets do Databricks, `dbutils.secrets`, chamadas reais de LLM (só o `mock`), e a
@@ -651,6 +742,8 @@ avisa se algo não existir.
 | driver com `OutOfMemory` | `PERSISTIR_INTERMEDIARIOS=false` numa base grande (linhagem gigante) | ligue a persistência em Delta |
 | job lento em E6 | shuffle com poucas partições | aumente `N_PARTICOES_SHUFFLE`; mais workers |
 | `check_sugestoes_iguais_em_clusters_distintos` > 0 | E7b não rodou (etapa pulada) ou tabela `_05b` antiga | rode E7 de novo |
+| uma célula "trava" por minutos sem stage progredindo | expressão Spark com crescimento exponencial (regra encadeada reutilizando a própria expressão duas vezes) | escreva regras como `greatest(base, regra1, regra2...)` ou materialize com `withColumn` a cada passo — ver comentários em `grau_certeza_cluster` e em E2 |
+| muitas linhas `D_REVISAO_HUMANA` por `COMPLEMENTO_AMBIGUO` | clientes com 2+ unidades no mesmo prédio e linhas sem complemento | esperado; priorize pela frequência (`qtd_ocorrencias_cluster`) ou use o LLM nesses clusters |
 
 ---
 
@@ -673,9 +766,19 @@ com a flag `CEP_SUGERIDO_NAO_VALIDADO`.
 
 **…usar o LLM em tudo?** Custo, latência e não determinismo (seção 4.16).
 
-**…uma sugestão por CPF em vez de por cluster?** Um CPF pode ter dois endereços legítimos (mudou de casa). A saída
-é por endereço (cluster). A última célula do notebook tem o pseudocódigo para escolher um por CPF, se você
-precisar.
+**…uma sugestão por CPF em vez de por cluster?** Um CPF pode ter dois endereços legítimos (mudou de casa, ou tem
+dois apartamentos no mesmo prédio). A saída é por endereço (cluster). A última célula do notebook tem o
+pseudocódigo para escolher um por CPF, se você precisar.
+
+**…e se o cliente tem dois apartamentos no mesmo prédio?** É exatamente o caso de E6b (seção 4.13b): rua, número
+e CEP iguais viram o mesmo `grupo_local`, mas `APTO 45` e `APTO 46` conflitam e formam clusters distintos, cada um
+com a sua sugestão. Linhas desse prédio sem complemento ficam num terceiro cluster, sem complemento sugerido e
+com a flag `COMPLEMENTO_AMBIGUO`. O mesmo vale para bloco, torre, casa, sala, lote/quadra, km e frente/fundos.
+
+**…por que as linhas sem complemento não vão para o apartamento mais frequente?** Porque seria um chute com
+consequência real (correspondência entregue no apartamento errado). O processo prefere entregar "sei a rua, o
+número e o CEP; não sei a unidade" a inventar. Se para o seu uso o chute for aceitável, é uma mudança pequena em
+`resolver_unidades` (atribuir ao anchor de maior peso) — mas faça isso conscientemente.
 
 **…por que Spark nativo mesmo quando o código fica mais longo?** Porque 10 bi de linhas transformam qualquer
 ineficiência em dias de cluster. Cada regra escrita como expressão nativa roda em Scala nos workers; a mesma regra
@@ -692,7 +795,8 @@ em Python (UDF) custaria de 10 a 100× mais.
 | `_dim_correios_cep`, `_dim_correios_logradouro` | Correios normalizados | compartilhadas entre lotes |
 | `_03_validado` | variantes × CEP + score de qualidade | auditoria da validação |
 | `_04_fuzzy_correios`, `_04b_variantes_enriquecidas` | resultado do fuzzy por consulta e por variante | auditoria do fuzzy |
-| `_05_clusters`, `_05b_clusters_consolidados` | linha → cluster (E6) e após E7b | E9 usa a `_05b` |
+| `_05_grupos_locais` | linha → grupo_local (E6, rua+número) | auditoria do nível 1 |
+| `_05_clusters`, `_05b_clusters_consolidados` | linha → cluster (E6b, grupo_local#unidade) e após E7b | E9 usa a `_05b` |
 | `_06a_sugestao_pass1`, `_06a_consolidacao` | 1ª eleição e mapa de fusões | auditoria de E7b |
 | `_06_sugestao_cluster`, `_06b_sugestao_cluster_llm` | sugestão por cluster, antes/depois do LLM | E9 |
 | `_07_llm_cache` | respostas do LLM por hash do prompt | economia em reexecuções |

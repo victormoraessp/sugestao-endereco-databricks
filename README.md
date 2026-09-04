@@ -7,7 +7,8 @@ devolvendo a tabela original mais as colunas `_sugestao`, o cluster do endereço
 - Notebook: `sugestao_endereco_cadastro_databricks.ipynb` (DBR 18 LTS, Spark 4.1, Python 3.12)
 - Explicação técnica completa (para quem vai manter/revisar): `EXPLICACAO_TECNICA.md`
 - Entradas: `tb_endereco` (idCPF, logradouro, numero, complemento, bairro, cidade, uf, cep_parte1, cep_parte2) e `tb_correios`
-- Saídas: `<prefixo>_final` (linhas originais + `_sugestao`), `<prefixo>_metricas` e tabelas intermediárias por etapa
+- Saídas: `<prefixo>_final` (linhas originais + `_sugestao` + `grau_certeza` / `requer_revisao_humana` / `motivos_revisao`), `<prefixo>_metricas` e tabelas intermediárias por etapa
+- Endereços diferentes no mesmo prédio (dois apartamentos, blocos, salas...) nunca são fundidos: clusters distintos por unidade
 - Tudo que é nome de tabela/coluna/API fica numa única célula (`AMBIENTES` com blocos `dev`/`prod`)
 
 Importe o `.ipynb` no Databricks (Workspace > Import), preencha o bloco de ambiente, ajuste os widgets e execute.
