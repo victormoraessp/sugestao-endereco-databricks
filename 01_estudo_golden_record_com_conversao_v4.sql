@@ -1,0 +1,3819 @@
+/* =============================================================================
+   ESTUDO 1  VALOR DO GOLDEN RECORD DE TELEFONE NA ENTREGA DE SMS
+   =============================================================================
+
+   PERGUNTA
+   O telefone de ranking 1 do Golden Record entrega mais SMS do que o telefone
+   que o CRM usa hoje? Se sim, quanto isso vale em reais?
+
+   DESENHO
+   Experimento natural. O Golden Record é construído a partir de fontes que não
+   alimentam o CRM e não observam o resultado dos disparos. Quando o telefone
+   usado pelo CRM coincide com o do Golden Record, a coincidência vem da
+   sobreposição de cadastros, e não de uma decisão de quem conhecia o desfecho.
+   Isso permite comparar dois grupos cuja formação é independente do resultado.
+
+   ESCOPO DESTE ARQUIVO
+   Trabalha apenas com o telefone de ranking 1. A comparação entre as demais
+   posições do ranking e a ordem de acionamento do CRM é objeto do estudo 2,
+   que consome as tabelas materializadas aqui.
+
+   SAÍDA
+   Um único resultado é exibido, o resumo executivo da seção 12.2, com um
+   indicador por linha. Os blocos A a D e F a H leem todas as campanhas da
+   janela. O bloco D fecha com a abertura do ganho por segmento, e o bloco E
+   conta a história do valuation dos briefings promocionais em cinco etapas,
+   citando os briefings que explicam cada número. O detalhe por briefing fica
+   na view vt_res_10_briefing_valuation.
+   Todos os cálculos intermediários ficam disponíveis como views para auditoria.
+
+   ESTRUTURA
+     00  Parâmetros do experimento e do valuation
+     01  Funções estatísticas
+     02  Fontes, preparação e materialização
+     03  Escopo de campanhas e grupos de análise
+     04  Diagnóstico de cobertura
+     05  Experimento natural, concordância de telefone
+     06  Desenho pareado dentro do mesmo cliente
+     07  Contrafactual dos insucessos
+     08  Testes de robustez
+     09  Valuation pelo custo de disparo, todas as campanhas, com abertura
+         por segmento transacional e promocional
+     10  Valuation pela conversão, apenas briefings promocionais
+     11  Aprofundamentos
+     12  Resumo executivo
+
+   CONTRATO DE DADOS
+   Golden Record, uma linha por CPF e ranking de telefone:
+     cpf, ranking, ddi, ddd, telefone, data_ingestao
+   Campanhas de SMS do CRM, uma linha por disparo:
+     cpf, id_briefing, telefone_bruto, bol_entregue, bol_nao_entregue,
+     data_ingestao, recebimento
+     prioridade_crm é opcional e representa a ordem do slot de telefone no
+     cadastro de origem.
+
+   JANELA
+   Definida pelos parâmetros data_inicio e data_fim da seção 00.2 e aplicada na
+   origem das campanhas. Os valores de valuation são do período coberto, e o
+   resumo informa quantos meses ele tem e o fator para anualizar.
+
+   DOIS ESCOPOS NA MESMA SAÍDA
+   Os blocos de oportunidade, evidência, robustez, custo, cadastro, qualidade e
+   evolução olham todas as campanhas da janela, transacionais e promocionais.
+   O bloco de valuation pela conversão olha apenas os briefings promocionais
+   listados na seção 00.5, porque só eles têm economia de conversão. Todo
+   briefing ausente dessa lista é tratado como transacional. A ponte entre os
+   dois escopos, quanto do ganho físico cai em cada segmento, está no bloco D.
+
+   GRÃO DE ANÁLISE
+   Um envio é a combinação de CPF, campanha e telefone. A campanha é o grão da
+   análise estatística. O briefing é a chave de filtro do escopo e da economia
+   de conversão, e pode reunir mais de uma campanha. Retentativas para o
+   mesmo trio são consolidadas em uma única observação.
+   ============================================================================= */
+
+
+/* =============================================================================
+   SEÇÃO 00  PARÂMETROS DO EXPERIMENTO E DO VALUATION
+   =============================================================================
+   Concentra todas as variáveis de decisão. Nenhum número fixo aparece nas
+   seções seguintes.
+
+   [JÚNIOR]    Painel de controle. Mudar um valor aqui muda todos os resultados
+               abaixo, sem tocar em nenhuma consulta.
+   [SÊNIOR]    Separar premissa de lógica mantém a análise auditável e permite
+               rodar cenários sem reescrever o pipeline.
+   [EXECUTIVO] As três alavancas financeiras do estudo são o custo de disparo,
+               a taxa de conversão sobre entregas e o retorno por conversão.
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   00.1  DESTINO DAS TABELAS MATERIALIZADAS
+
+   As duas tabelas criadas na seção 02 persistem entre sessões e são a fonte do
+   estudo 2. O catálogo e o schema abaixo aparecem em todos os comandos de
+   materialização e são o único ponto a ajustar.
+
+   Nomes definidos:
+     tb_gr_telefone_ranking   telefones do Golden Record, um por CPF e posição
+     tb_crm_envio_analitico   um registro por envio, já cruzado com o Golden Record
+----------------------------------------------------------------------------- */
+
+
+/* -----------------------------------------------------------------------------
+   00.2  PARÂMETROS GERAIS
+
+   custo_sms         Custo unitário de um disparo, em reais. Incide sobre todo
+                     disparo, entregue ou não.
+   taxa_conversao    Fração dos SMS entregues que gera a conversão de interesse.
+   valor_conversao   Retorno financeiro médio de cada conversão, em reais.
+   z_95              Quantil da Normal padrão para intervalos de 95 por cento.
+   min_envios_braco  Mínimo de envios em cada braço para uma campanha ser
+                     testada isoladamente na seção 08.
+   min_n_estrato     Mínimo de envios para um estrato entrar no estimador
+                     estratificado da seção 05.
+   volume_referencia Volume usado nos exemplos numéricos do resumo executivo,
+                     para tornar cada percentual tangível.
+   data_inicio       Primeiro dia da janela de disparos, inclusive.
+   data_fim          Primeiro dia após a janela, exclusive. Janeiro a agosto de
+                     2026 corresponde a 2026-01-01 e 2026-09-01. Os valores
+                     dos blocos de valuation são do período coberto, e o resumo
+                     informa o fator de anualização.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_param AS
+SELECT
+  CAST(0.04       AS DOUBLE) AS custo_sms,
+  CAST(0.0050     AS DOUBLE) AS taxa_conversao,
+  CAST(150.00     AS DOUBLE) AS valor_conversao,
+  CAST(1.959964   AS DOUBLE) AS z_95,
+  CAST(50         AS INT)    AS min_envios_braco,
+  CAST(2          AS INT)    AS min_n_estrato,
+  CAST(0.05       AS DOUBLE) AS alpha,
+  CAST(1000000    AS BIGINT) AS volume_referencia,
+  CAST('2026-01-01' AS DATE) AS data_inicio,
+  CAST('2026-09-01' AS DATE) AS data_fim
+;
+
+
+/* -----------------------------------------------------------------------------
+   00.3  GRUPOS DE CAMPANHAS
+
+   Define até três recortes analisados em paralelo. Cada grupo produz sua
+   própria linha no resumo executivo, e o rótulo TOTAL consolida o conjunto.
+
+   REGRA DE ESCOPO
+     O universo do estudo é sempre o conjunto de briefings da seção 00.5, que
+     são os que têm economia de conversão informada. Briefings fora dessa
+     tabela não entram em nenhuma análise.
+     Os três grupos abaixo são recortes opcionais dentro desse universo. Com ao
+     menos um grupo preenchido, cada grupo vira uma linha nos resultados e
+     TOTAL é a união deles. Com os três grupos vazios, o estudo roda sobre
+     todos os briefings da seção 00.5 sob o rótulo TOTAL, que é o padrão.
+     Um identificador listado em um grupo mas ausente da seção 00.5 é
+     ignorado.
+
+   COMO INFORMAR
+   O recorte é feito pelo identificador de briefing, e não pelo nome da
+   campanha. Um briefing pode abranger mais de uma campanha, e todas elas
+   entram quando o briefing é listado.
+     id_briefings        vetor de identificadores, por exemplo array('7801', '13786')
+     id_briefings_texto  identificadores separados por vírgula, por exemplo '7801, 13786'
+   O vetor tem precedência. Espaços em volta dos nomes são removidos e nomes
+   repetidos desconsiderados. Nulo, vetor vazio ou texto em branco desligam o
+   grupo sem gerar erro.
+
+   taxa_conversao_grupo e valor_conversao_grupo permitem premissas financeiras
+   distintas por recorte. Nulas, valem os parâmetros gerais.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_param_grupos AS
+SELECT
+  'GRUPO_1'                   AS grupo,
+  'Recorte 1'                 AS descricao,
+  CAST(NULL AS ARRAY<STRING>) AS id_briefings,
+  CAST(NULL AS STRING)        AS id_briefings_texto,
+  CAST(NULL AS DOUBLE)        AS taxa_conversao_grupo,
+  CAST(NULL AS DOUBLE)        AS valor_conversao_grupo
+UNION ALL
+SELECT 'GRUPO_2', 'Recorte 2', CAST(NULL AS ARRAY<STRING>), CAST(NULL AS STRING),
+       CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)
+UNION ALL
+SELECT 'GRUPO_3', 'Recorte 3', CAST(NULL AS ARRAY<STRING>), CAST(NULL AS STRING),
+       CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)
+;
+
+
+/* -----------------------------------------------------------------------------
+   00.4  GRADE DE SENSIBILIDADE DO VALUATION
+
+   Multiplicadores aplicados sobre a taxa de conversão e sobre o valor por
+   conversão. A combinação de um por um reproduz os parâmetros gerais.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_param_sensibilidade AS
+SELECT
+  m_taxa.mult    AS mult_taxa,
+  m_taxa.rotulo  AS rotulo_taxa,
+  m_valor.mult   AS mult_valor,
+  m_valor.rotulo AS rotulo_valor
+FROM (
+  SELECT * FROM VALUES
+    (CAST(0.50 AS DOUBLE), 'conversao_metade'),
+    (CAST(1.00 AS DOUBLE), 'conversao_base'),
+    (CAST(2.00 AS DOUBLE), 'conversao_dobro')
+  AS t(mult, rotulo)
+) m_taxa
+CROSS JOIN (
+  SELECT * FROM VALUES
+    (CAST(0.50 AS DOUBLE), 'ticket_metade'),
+    (CAST(1.00 AS DOUBLE), 'ticket_base'),
+    (CAST(2.00 AS DOUBLE), 'ticket_dobro')
+  AS t(mult, rotulo)
+) m_valor
+;
+
+
+/* -----------------------------------------------------------------------------
+   00.5  ECONOMIA POR BRIEFING
+
+   Cada briefing tem sua própria economia. Uma campanha de cobrança, uma de
+   venda cruzada e uma de relacionamento convertem em proporções diferentes e
+   geram tíquetes diferentes. Aplicar uma única taxa e um único tíquete a todos
+   distorce o valuation nas duas direções: superestima o ganho onde a conversão
+   é baixa e subestima onde é alta.
+
+   Esta estrutura recebe, por briefing, os parâmetros que fecham a conta. Com
+   eles, o estudo calcula quantas entregas o Golden Record recupera em cada
+   briefing, converte em conversões pela taxa daquele briefing e em receita pelo
+   tíquete daquele briefing.
+
+   ESTA TABELA DEFINE O SEGMENTO PROMOCIONAL
+   Os briefings listados aqui são os promocionais, os únicos com dado de
+   conversão e tíquete. Só eles entram no valuation pela conversão, bloco E
+   do resumo. Todos os demais briefings da janela continuam no estudo, em
+   todas as outras seções, tratados como transacionais: para eles o valor do
+   Golden Record é medido em mídia, no bloco D. Para ampliar a leitura de
+   receita, acrescente briefings aqui. Para tirar um briefing do estudo
+   inteiro, use os recortes da seção 00.3.
+
+   COLUNAS
+     id_briefing            identificador do briefing, o mesmo da base de
+                            campanhas
+     conversao_pct          taxa de conversão sobre entregas, EM PERCENTUAL.
+                            5.09 significa 5,09 por cento, e 0.34 significa
+                            0,34 por cento. O estudo divide por cem internamente.
+     conversoes_observadas  alternativa ao percentual. Quando a operação conhece
+                            o número absoluto de conversões do briefing mas não
+                            a taxa, informe aqui e deixe conversao_pct nula. O
+                            estudo deriva a taxa dividindo pelas entregas.
+     ticket_medio           retorno médio de cada conversão, em reais
+
+   REGRA DE RESERVA
+     A taxa usada é, nesta ordem: o percentual informado, ou as conversões
+     observadas divididas pelas entregas do briefing, ou a taxa geral do grupo.
+     O tíquete é o informado ou, na falta, o valor geral do grupo. Briefings
+     ausentes desta tabela não recebem economia alguma: são transacionais e
+     ficam fora da leitura de receita.
+
+   COMO PREENCHER
+     Uma linha por briefing dentro do VALUES. As linhas abaixo são exemplos
+     de formato e devem ser substituídas pela lista real de briefings
+     promocionais. Os identificadores são escritos entre aspas porque a
+     comparação com a base é feita como texto, o que funciona tanto para
+     identificadores numéricos quanto alfanuméricos.
+     Se os parâmetros já existirem em uma tabela do catálogo, substitua o bloco
+     VALUES por um SELECT sobre essa tabela, mantendo os quatro nomes de coluna.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_param_briefing AS
+SELECT
+  CAST(id_briefing AS STRING)            AS id_briefing,
+  CAST(conversao_pct AS DOUBLE)          AS conversao_pct,
+  CAST(conversoes_observadas AS BIGINT)  AS conversoes_observadas,
+  CAST(ticket_medio AS DOUBLE)           AS ticket_medio
+FROM VALUES
+  ('7801',  0.01, NULL, 3258.00),
+  ('13786', 0.34, NULL, 2336.00),
+  ('14344', 5.09, NULL, 4316.00)
+AS t(id_briefing, conversao_pct, conversoes_observadas, ticket_medio)
+;
+
+
+/* =============================================================================
+   SEÇÃO 01  FUNÇÕES ESTATÍSTICAS
+   =============================================================================
+   O motor não expõe nativamente a distribuição Normal acumulada nem intervalos
+   de confiança de proporção.
+
+   REGRA DE USO
+   Nenhuma destas funções pode ser chamada dentro de round. A expansão de uma
+   função SQL dentro de uma expressão arredondada reescreve a expressão em uma
+   projeção intermediária e o literal das casas decimais deixa de ser
+   reconhecido como constante, o que faz a consulta ser recusada. Sempre que um
+   valor produzido por estas funções precisa ser arredondado, ele é calculado
+   em uma etapa anterior, com resultado nomeado, e arredondado na etapa
+   seguinte.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMPORARY FUNCTION stat_t_as(x DOUBLE)
+RETURNS DOUBLE
+RETURN 1.0 / (1.0 + 0.2316419 * abs(x));
+
+CREATE OR REPLACE TEMPORARY FUNCTION stat_tail_as(x DOUBLE)
+RETURNS DOUBLE
+RETURN
+  (exp(-(x * x) / 2.0) / sqrt(2.0 * pi()))
+  * stat_t_as(x)
+  * ( 0.319381530
+      + stat_t_as(x) * ( -0.356563782
+      + stat_t_as(x) * (  1.781477937
+      + stat_t_as(x) * ( -1.821255978
+      + stat_t_as(x) *    1.330274429 ))));
+
+CREATE OR REPLACE TEMPORARY FUNCTION norm_cdf(x DOUBLE)
+RETURNS DOUBLE
+RETURN CASE WHEN x IS NULL THEN NULL
+            WHEN x >= 0    THEN 1.0 - stat_tail_as(x)
+            ELSE                stat_tail_as(x) END;
+
+CREATE OR REPLACE TEMPORARY FUNCTION p_valor_bilateral(z DOUBLE)
+RETURNS DOUBLE
+RETURN CASE WHEN z IS NULL THEN NULL ELSE 2.0 * (1.0 - norm_cdf(abs(z))) END;
+
+CREATE OR REPLACE TEMPORARY FUNCTION p_valor_qui2_1gl(chi2 DOUBLE)
+RETURNS DOUBLE
+RETURN CASE WHEN chi2 IS NULL OR chi2 < 0 THEN NULL
+            ELSE 2.0 * (1.0 - norm_cdf(sqrt(chi2))) END;
+
+CREATE OR REPLACE TEMPORARY FUNCTION wilson_inf(k DOUBLE, n DOUBLE)
+RETURNS DOUBLE
+RETURN
+  CASE WHEN n IS NULL OR n <= 0 OR k IS NULL THEN NULL ELSE
+    ( (k / n) + (1.959964 * 1.959964) / (2.0 * n)
+      - 1.959964 * sqrt( (k / n) * (1.0 - k / n) / n
+                         + (1.959964 * 1.959964) / (4.0 * n * n) ) )
+    / (1.0 + (1.959964 * 1.959964) / n)
+  END;
+
+CREATE OR REPLACE TEMPORARY FUNCTION wilson_sup(k DOUBLE, n DOUBLE)
+RETURNS DOUBLE
+RETURN
+  CASE WHEN n IS NULL OR n <= 0 OR k IS NULL THEN NULL ELSE
+    ( (k / n) + (1.959964 * 1.959964) / (2.0 * n)
+      + 1.959964 * sqrt( (k / n) * (1.0 - k / n) / n
+                         + (1.959964 * 1.959964) / (4.0 * n * n) ) )
+    / (1.0 + (1.959964 * 1.959964) / n)
+  END;
+
+
+/* =============================================================================
+   SEÇÃO 02  FONTES, PREPARAÇÃO E MATERIALIZAÇÃO
+   =============================================================================
+   Constrói a base do estudo e a persiste em duas tabelas. A persistência tem
+   três objetivos: evitar recalcular joins pesados a cada consulta, congelar o
+   recorte analisado para que os números do relatório sejam reproduzíveis, e
+   servir de insumo ao estudo 2 sem repetir o processamento.
+
+   [JÚNIOR]    Organizar o Golden Record com um telefone por CPF e posição,
+               limpar a base do CRM e juntar as duas por CPF.
+   [SÊNIOR]    A comparação de telefones acontece em dois níveis. O exato
+               compara a string completa. O tolerante compara área mais os oito
+               dígitos finais, neutralizando nono dígito e código de país. O CPF
+               é normalizado antes da deduplicação do Golden Record, e não
+               depois, para que duas grafias do mesmo documento não gerem dois
+               registros de ranking 1.
+   [EXECUTIVO] Para cada SMS enviado passa a ser possível responder se ele foi
+               para o telefone recomendado e se chegou ao destino.
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   02.1  FONTES DE DADOS E NORMALIZAÇÃO DE NOMES
+
+   Único ponto de contato com as tabelas de origem. Cada coluna é renomeada aqui
+   para o nome canônico usado no restante do arquivo. Para apontar o estudo para
+   outras tabelas, altere o nome da tabela no FROM e a expressão à esquerda de
+   cada AS.
+
+   NOMES CANÔNICOS DO GOLDEN RECORD
+     cpf            identificador do cliente, em qualquer formatação
+     ranking        posição de qualidade do telefone, sendo 1 a melhor
+     ddi            código do país
+     ddd            código de área
+     telefone       número sem país e sem área
+     data_ingestao  momento da carga, usado para escolher o registro mais
+                    recente quando há mais de um para o mesmo cpf e ranking.
+                    Precisa apenas ser ordenável.
+
+   NOMES CANÔNICOS DAS CAMPANHAS DE SMS
+     cpf               identificador do cliente, em qualquer formatação
+     campanha          nome da campanha. É o grão da análise estatística e o
+                       estrato do estimador controlado por campanha
+     id_briefing       identificador do briefing. É a chave de filtro do escopo
+                       e a chave da economia por briefing. Um briefing pode
+                       reunir mais de uma campanha
+     telefone_bruto    país, área e número concatenados
+     bol_entregue      indicador de entrega
+     bol_nao_entregue  indicador de falha de entrega
+     data_ingestao_crm momento em que o registro do disparo entrou na base.
+                       Delimita a janela do estudo e permite verificar se a
+                       recomendação do Golden Record já existia quando a
+                       campanha ocorreu.
+     prioridade_crm    ordem do slot de telefone no cadastro de origem. Campo
+                       opcional. Sem esse dado, o valor permanece nulo e a ordem
+                       é inferida pelo padrão de uso do número.
+
+   FILTROS APLICADOS NA ORIGEM DAS CAMPANHAS
+     recebimento       descarta as mensagens recebidas dos clientes, mantendo
+                       apenas os disparos enviados pela operação. Sem esse
+                       filtro, respostas de clientes entrariam no denominador e
+                       distorceriam a taxa de entrega.
+     data_ingestao     restringe o estudo à janela definida em vt_param, entre
+                       data_inicio inclusive e data_fim exclusive. Os valores
+                       dos blocos de valuation são do período coberto; o resumo
+                       traz o fator de anualização.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_fonte_golden_record AS
+SELECT
+  cpf                AS cpf,
+  ranking            AS ranking,
+  ddi                AS ddi,
+  ddd                AS ddd,
+  telefone           AS telefone,
+  data_ingestao      AS data_ingestao
+FROM temp_view_golden_record
+;
+
+CREATE OR REPLACE TEMP VIEW vt_fonte_crm_sms AS
+SELECT
+  cpf                AS cpf,
+  campanha           AS campanha,
+  id_briefing        AS id_briefing,
+  telefone_bruto     AS telefone_bruto,
+  bol_entregue       AS bol_entregue,
+  bol_nao_entregue   AS bol_nao_entregue,
+  data_ingestao      AS data_ingestao_crm,
+  CAST(NULL AS INT)  AS prioridade_crm
+FROM temp_view_crm_sms
+WHERE 1 = 1
+  AND coalesce(CAST(recebimento AS BOOLEAN), FALSE) = FALSE
+  AND to_date(data_ingestao) >= (SELECT data_inicio FROM vt_param)
+  AND to_date(data_ingestao) <  (SELECT data_fim    FROM vt_param)
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.2  GOLDEN RECORD, UM TELEFONE POR CPF E POSIÇÃO
+
+   telefone_gr  país, área e número concatenados, apenas dígitos
+   chave_gr     área e oito dígitos finais, usada na comparação tolerante
+
+   O estudo 1 usa apenas a posição 1. As demais posições são preservadas porque
+   o estudo 2 as consome.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_gr_ranking_calc AS
+WITH normalizado AS (
+  SELECT
+    lpad(regexp_replace(CAST(cpf AS STRING), '[^0-9]', ''), 11, '0')           AS cpf,
+    CAST(int(ranking) AS INT)                                                  AS ranking,
+    regexp_replace(
+      concat(CAST(int(ddi) AS STRING), CAST(int(ddd) AS STRING), telefone),
+      '[^0-9]', '')                                                            AS telefone_gr,
+    CAST(int(ddd) AS STRING)                                                   AS ddd_gr,
+    concat(CAST(int(ddd) AS STRING), '-',
+           right(regexp_replace(CAST(telefone AS STRING), '[^0-9]', ''), 8))   AS chave_gr,
+    data_ingestao
+  FROM vt_fonte_golden_record
+  WHERE ranking IS NOT NULL
+    AND telefone IS NOT NULL
+)
+SELECT
+  cpf,
+  ranking,
+  telefone_gr,
+  ddd_gr,
+  chave_gr,
+  data_ingestao AS data_ingestao_gr
+FROM normalizado
+QUALIFY row_number() OVER (PARTITION BY cpf, ranking ORDER BY data_ingestao DESC) = 1
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.3  MATERIALIZAÇÃO DO GOLDEN RECORD
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS catalogo.schema.tb_gr_telefone_ranking;
+
+CREATE TABLE catalogo.schema.tb_gr_telefone_ranking
+CLUSTER BY AUTO
+AS SELECT * FROM vt_gr_ranking_calc;
+
+CREATE OR REPLACE TEMP VIEW tb_gr_telefone_ranking AS
+SELECT * FROM catalogo.schema.tb_gr_telefone_ranking;
+
+CREATE OR REPLACE TEMP VIEW vt_gr_rank1 AS
+SELECT cpf, telefone_gr, ddd_gr, chave_gr, data_ingestao_gr
+FROM tb_gr_telefone_ranking
+WHERE ranking = 1
+;
+
+CREATE OR REPLACE TEMP VIEW vt_gr_profundidade_cpf AS
+SELECT
+  cpf,
+  count(*)                    AS rankings_disponiveis,
+  max(ranking)                AS ranking_maximo,
+  count(DISTINCT telefone_gr) AS telefones_distintos
+FROM tb_gr_telefone_ranking
+GROUP BY cpf
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.4  CRM, NORMALIZAÇÃO E QUALIDADE
+
+   entregue assume 1 quando o registro indica entrega, 0 quando indica falha e
+   nulo quando os dois indicadores se contradizem ou estão ambos ausentes.
+   Apenas registros classificados como OK entram no estudo.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_crm_envios_raw AS
+WITH base AS (
+  SELECT
+    lpad(regexp_replace(CAST(cpf AS STRING), '[^0-9]', ''), 11, '0')  AS cpf,
+    CAST(campanha AS STRING)                                          AS campanha,
+    CAST(id_briefing AS STRING)                                       AS id_briefing,
+    regexp_replace(CAST(telefone_bruto AS STRING), '[^0-9]', '')      AS telefone_crm,
+    coalesce(CAST(bol_entregue     AS BOOLEAN), false)                AS flag_entregue,
+    coalesce(CAST(bol_nao_entregue AS BOOLEAN), false)                AS flag_nao_entregue,
+    to_date(data_ingestao_crm)                                        AS data_disparo,
+    CAST(prioridade_crm AS INT)                                       AS prioridade_crm
+  FROM vt_fonte_crm_sms
+),
+sem_pais AS (
+  SELECT
+    *,
+    CASE WHEN length(telefone_crm) >= 12 AND telefone_crm LIKE '55%'
+         THEN substr(telefone_crm, 3)
+         ELSE telefone_crm END AS telefone_crm_local
+  FROM base
+)
+SELECT
+  cpf, campanha, id_briefing, telefone_crm, flag_entregue, flag_nao_entregue, data_disparo, prioridade_crm,
+  left(telefone_crm_local, 2)                                            AS ddd_crm,
+  concat(left(telefone_crm_local, 2), '-', right(telefone_crm_local, 8)) AS chave_crm
+FROM sem_pais
+;
+
+CREATE OR REPLACE TEMP VIEW vt_crm_envios_qualidade AS
+SELECT
+  *,
+  CASE
+    WHEN cpf IS NULL OR cpf = '00000000000' OR length(cpf) <> 11 THEN 'SEM_CPF'
+    WHEN telefone_crm IS NULL OR length(telefone_crm) < 10       THEN 'SEM_TELEFONE'
+    WHEN flag_entregue AND flag_nao_entregue                     THEN 'STATUS_INCONSISTENTE'
+    WHEN NOT flag_entregue AND NOT flag_nao_entregue             THEN 'SEM_STATUS'
+    ELSE 'OK'
+  END AS qualidade,
+  CASE
+    WHEN flag_entregue AND NOT flag_nao_entregue THEN 1
+    WHEN flag_nao_entregue AND NOT flag_entregue THEN 0
+    ELSE NULL
+  END AS entregue
+FROM vt_crm_envios_raw
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.5  ORDEM DE ACIONAMENTO DOS TELEFONES NO CRM
+
+   Coluna calculada aqui para servir ao estudo 2, que compara a ordem do CRM
+   com a ordem do Golden Record. O estudo 1 não a utiliza.
+
+   Quando prioridade_crm está preenchida, ela é respeitada. Sem esse campo, a
+   ordem é inferida pelo padrão de uso: o telefone acionado no maior número de
+   campanhas do CPF é tratado como principal. O desempate final é o próprio
+   número, o que torna a ordem reprodutível.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_crm_perfil_telefone AS
+WITH agg AS (
+  SELECT
+    cpf,
+    telefone_crm,
+    min(prioridade_crm)      AS prioridade_declarada,
+    count(DISTINCT campanha) AS campanhas_com_uso,
+    count(*)                 AS envios_totais
+  FROM vt_crm_envios_qualidade
+  WHERE qualidade = 'OK'
+  GROUP BY cpf, telefone_crm
+)
+SELECT
+  *,
+  CASE WHEN row_number() OVER (
+         PARTITION BY cpf
+         ORDER BY campanhas_com_uso DESC, envios_totais DESC, telefone_crm ASC) = 1
+       THEN 1 ELSE 0 END AS telefone_mais_acionado
+FROM agg
+;
+
+CREATE OR REPLACE TEMP VIEW vt_crm_envios AS
+WITH consolidado AS (
+  SELECT
+    cpf, campanha, id_briefing, telefone_crm, ddd_crm, chave_crm,
+    max(entregue)      AS entregue,
+    count(*)           AS registros_originais,
+    min(data_disparo)  AS data_disparo,
+    max(data_disparo)  AS data_disparo_ultima
+  FROM vt_crm_envios_qualidade
+  WHERE qualidade = 'OK'
+  GROUP BY cpf, campanha, id_briefing, telefone_crm, ddd_crm, chave_crm
+)
+SELECT
+  c.cpf,
+  c.campanha,
+  c.id_briefing,
+  c.telefone_crm,
+  c.ddd_crm,
+  c.chave_crm,
+  c.entregue,
+  c.registros_originais,
+  c.data_disparo,
+  c.data_disparo_ultima,
+  coalesce(p.telefone_mais_acionado, 0) AS heuristica_mais_acionado,
+  dense_rank() OVER (
+    PARTITION BY c.cpf, c.campanha
+    ORDER BY coalesce(p.prioridade_declarada, 9999) ASC,
+             p.campanhas_com_uso DESC,
+             p.envios_totais DESC,
+             c.telefone_crm ASC
+  ) AS ranking_crm,
+  count(*) OVER (PARTITION BY c.cpf, c.campanha) AS telefones_na_campanha
+FROM consolidado c
+LEFT JOIN vt_crm_perfil_telefone p
+  ON c.cpf = p.cpf AND c.telefone_crm = p.telefone_crm
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.6  BASE ANALÍTICA
+
+   Um envio por linha, com o telefone de ranking 1 ao lado e a classificação de
+   concordância.
+
+   classe_concordancia
+     SEM_GR           CPF ausente do Golden Record, sem contrafactual possível
+     IGUAL_EXATO      o CRM usou exatamente o telefone de ranking 1
+     IGUAL_TOLERANTE  mesmo número, com diferença apenas de formatação
+     DIFERENTE        o Golden Record indicaria outro telefone
+
+   ranking_gr_do_telefone_usado informa em que posição do Golden Record está o
+   número que o CRM de fato usou. Fica nulo quando o número não aparece em
+   nenhuma posição. Assim como ranking_crm, é insumo do estudo 2.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_base_calc AS
+WITH com_rank1 AS (
+  SELECT
+    e.cpf,
+    e.campanha,
+    e.id_briefing,
+    e.telefone_crm,
+    e.chave_crm,
+    e.entregue,
+    e.registros_originais,
+    e.data_disparo,
+    e.data_disparo_ultima,
+    e.ddd_crm,
+    e.heuristica_mais_acionado,
+    e.ranking_crm,
+    e.telefones_na_campanha,
+    g.telefone_gr,
+    g.ddd_gr,
+    g.chave_gr,
+    g.data_ingestao_gr,
+    (g.cpf IS NOT NULL)                    AS tem_gr,
+    coalesce(prof.rankings_disponiveis, 0) AS rankings_disponiveis
+  FROM vt_crm_envios e
+  LEFT JOIN vt_gr_rank1 g               ON e.cpf = g.cpf
+  LEFT JOIN vt_gr_profundidade_cpf prof ON e.cpf = prof.cpf
+),
+com_posicao AS (
+  SELECT
+    c.*,
+    t.ranking AS ranking_gr_do_telefone_usado
+  FROM com_rank1 c
+  LEFT JOIN tb_gr_telefone_ranking t
+    ON c.cpf = t.cpf
+   AND (c.telefone_crm = t.telefone_gr OR c.chave_crm = t.chave_gr)
+  QUALIFY row_number() OVER (
+    PARTITION BY c.cpf, c.campanha, c.telefone_crm
+    ORDER BY t.ranking ASC NULLS LAST
+  ) = 1
+)
+SELECT
+  *,
+  CASE
+    WHEN NOT tem_gr                 THEN 'SEM_GR'
+    WHEN telefone_crm = telefone_gr THEN 'IGUAL_EXATO'
+    WHEN chave_crm    = chave_gr    THEN 'IGUAL_TOLERANTE'
+    ELSE                                 'DIFERENTE'
+  END AS classe_concordancia,
+  CASE
+    WHEN NOT tem_gr THEN NULL
+    WHEN telefone_crm = telefone_gr OR chave_crm = chave_gr THEN 1
+    ELSE 0
+  END AS concordante,
+  CASE
+    WHEN NOT tem_gr THEN NULL
+    WHEN telefone_crm = telefone_gr THEN 1
+    ELSE 0
+  END AS concordante_exato
+FROM com_posicao
+;
+
+
+/* -----------------------------------------------------------------------------
+   02.7  MATERIALIZAÇÃO DA BASE ANALÍTICA
+----------------------------------------------------------------------------- */
+DROP TABLE IF EXISTS catalogo.schema.tb_crm_envio_analitico;
+
+CREATE TABLE catalogo.schema.tb_crm_envio_analitico
+CLUSTER BY AUTO
+AS SELECT * FROM vt_base_calc;
+
+CREATE OR REPLACE TEMP VIEW tb_crm_envio_analitico AS
+SELECT * FROM catalogo.schema.tb_crm_envio_analitico;
+
+
+/* =============================================================================
+   SEÇÃO 03  ESCOPO DE CAMPANHAS E GRUPOS DE ANÁLISE
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_grupo_lista AS
+SELECT
+  grupo,
+  descricao,
+  taxa_conversao_grupo,
+  valor_conversao_grupo,
+  CASE
+    WHEN id_briefings IS NOT NULL AND size(id_briefings) > 0
+      THEN array_distinct(filter(transform(id_briefings, x -> trim(x)), x -> length(x) > 0))
+    WHEN id_briefings_texto IS NOT NULL AND length(trim(id_briefings_texto)) > 0
+      THEN array_distinct(filter(transform(split(id_briefings_texto, ','), x -> trim(x)),
+                                 x -> length(x) > 0))
+    ELSE CAST(NULL AS ARRAY<STRING>)
+  END AS id_briefings
+FROM vt_param_grupos
+;
+
+CREATE OR REPLACE TEMP VIEW vt_grupo_briefing AS
+WITH definido AS (
+  SELECT grupo, explode(id_briefings) AS id_briefing
+  FROM vt_grupo_lista
+  WHERE id_briefings IS NOT NULL AND size(id_briefings) > 0
+),
+contagem AS (
+  SELECT count(*) AS listadas FROM definido
+),
+universo AS (
+  SELECT DISTINCT id_briefing FROM tb_crm_envio_analitico
+),
+total_sem_lista AS (
+  SELECT 'TOTAL' AS grupo, u.id_briefing
+  FROM universo u CROSS JOIN contagem c
+  WHERE c.listadas = 0
+),
+total_com_lista AS (
+  SELECT DISTINCT 'TOTAL' AS grupo, id_briefing FROM definido
+)
+SELECT grupo, id_briefing FROM definido
+UNION ALL SELECT grupo, id_briefing FROM total_com_lista
+UNION ALL SELECT grupo, id_briefing FROM total_sem_lista
+;
+
+CREATE OR REPLACE TEMP VIEW vt_grupo_param AS
+SELECT
+  g.grupo,
+  g.descricao,
+  coalesce(g.taxa_conversao_grupo,  p.taxa_conversao)  AS taxa_conversao,
+  coalesce(g.valor_conversao_grupo, p.valor_conversao) AS valor_conversao,
+  p.custo_sms,
+  p.volume_referencia
+FROM vt_grupo_lista g
+CROSS JOIN vt_param p
+WHERE g.id_briefings IS NOT NULL AND size(g.id_briefings) > 0
+UNION ALL
+SELECT
+  'TOTAL',
+  'Consolidado das campanhas em escopo',
+  p.taxa_conversao,
+  p.valor_conversao,
+  p.custo_sms,
+  p.volume_referencia
+FROM vt_param p
+;
+
+CREATE OR REPLACE TEMP VIEW vt_base_grupo AS
+SELECT
+  g.grupo,
+  b.*,
+  (p.id_briefing IS NOT NULL)                                       AS promocional,
+  CASE WHEN p.id_briefing IS NOT NULL THEN 'PROMOCIONAL' ELSE 'TRANSACIONAL' END AS segmento
+FROM tb_crm_envio_analitico b
+JOIN vt_grupo_briefing g ON b.id_briefing = g.id_briefing
+LEFT JOIN (SELECT DISTINCT id_briefing FROM vt_param_briefing) p ON b.id_briefing = p.id_briefing
+;
+
+CREATE OR REPLACE TEMP VIEW vt_experimento AS
+SELECT * FROM vt_base_grupo WHERE tem_gr
+;
+
+CREATE OR REPLACE TEMP VIEW vt_campanha_volume AS
+SELECT
+  grupo,
+  campanha,
+  count(*)                                         AS n_envios,
+  sum(entregue)                                    AS n_entregues,
+  avg(entregue)                                    AS taxa_entrega,
+  sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)          AS n_com_gr,
+  sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END) AS n_concordante,
+  sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END) AS n_discordante,
+  CASE
+    WHEN count(*) <      100 THEN '1. ate 100'
+    WHEN count(*) <     1000 THEN '2. 100 a 1 mil'
+    WHEN count(*) <    10000 THEN '3. 1 mil a 10 mil'
+    WHEN count(*) <   100000 THEN '4. 10 mil a 100 mil'
+    WHEN count(*) <  1000000 THEN '5. 100 mil a 1 milhao'
+    ELSE                          '6. acima de 1 milhao'
+  END                                              AS faixa_volume
+FROM vt_base_grupo
+GROUP BY grupo, campanha
+;
+
+
+/* =============================================================================
+   SEÇÃO 04  DIAGNÓSTICO DE COBERTURA
+   =============================================================================
+   Mede o terreno antes de qualquer inferência: quanto o Golden Record alcança,
+   quanto o CRM já concorda com ele e se o grupo estudado é comparável ao
+   restante da base.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_res_04_volume AS
+SELECT
+  grupo,
+  count(*)                                        AS disparos,
+  count(DISTINCT cpf)                             AS clientes,
+  count(DISTINCT campanha)                        AS id_briefings,
+  sum(entregue)                                   AS entregas,
+  count(*) - sum(entregue)                        AS insucessos,
+  avg(entregue)                                   AS taxa_entrega,
+  sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)         AS disparos_com_gr,
+  avg(CASE WHEN tem_gr THEN 1 ELSE 0 END)         AS cobertura_disparo,
+  count(DISTINCT CASE WHEN tem_gr THEN cpf END)   AS clientes_com_gr,
+  count(DISTINCT CASE WHEN tem_gr THEN cpf END)
+    / nullif(count(DISTINCT cpf), 0)              AS cobertura_cliente
+FROM vt_base_grupo
+GROUP BY grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_04_concordancia AS
+SELECT
+  grupo,
+  classe_concordancia,
+  count(*)                                                   AS envios,
+  count(*) / sum(count(*)) OVER (PARTITION BY grupo)         AS fracao_envios,
+  count(DISTINCT cpf)                                        AS cpfs,
+  avg(entregue)                                              AS taxa_entrega
+FROM vt_experimento
+GROUP BY grupo, classe_concordancia
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_04_anatomia_insucesso AS
+SELECT
+  grupo,
+  count(*)                                                                    AS insucessos,
+  sum(CASE WHEN NOT tem_gr THEN 1 ELSE 0 END)                                 AS sem_gr,
+  sum(CASE WHEN classe_concordancia IN ('IGUAL_EXATO','IGUAL_TOLERANTE')
+           THEN 1 ELSE 0 END)                                                 AS gr_igual,
+  sum(CASE WHEN classe_concordancia = 'DIFERENTE' THEN 1 ELSE 0 END)          AS gr_diferente,
+  sum(CASE WHEN classe_concordancia = 'DIFERENTE' THEN 1 ELSE 0 END)
+    / nullif(sum(CASE WHEN tem_gr THEN 1 ELSE 0 END), 0)                      AS fracao_sobre_com_gr
+FROM vt_base_grupo
+WHERE entregue = 0
+GROUP BY grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_04_selecao AS
+WITH agg AS (
+  SELECT
+    grupo,
+    sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)            AS n_com,
+    sum(CASE WHEN tem_gr THEN entregue ELSE 0 END)     AS k_com,
+    sum(CASE WHEN NOT tem_gr THEN 1 ELSE 0 END)        AS n_sem,
+    sum(CASE WHEN NOT tem_gr THEN entregue ELSE 0 END) AS k_sem
+  FROM vt_base_grupo
+  GROUP BY grupo
+),
+calc AS (
+  SELECT
+    *,
+    k_com / nullif(n_com, 0)                   AS p_com,
+    k_sem / nullif(n_sem, 0)                   AS p_sem,
+    (k_com + k_sem) / nullif(n_com + n_sem, 0) AS p_pool
+  FROM agg
+)
+SELECT
+  grupo,
+  n_com AS envios_com_gr,
+  n_sem AS envios_sem_gr,
+  p_com AS taxa_com_gr,
+  p_sem AS taxa_sem_gr,
+  p_com - p_sem AS diferenca,
+  CASE WHEN n_sem > 0 AND n_com > 0 AND p_pool NOT IN (0, 1)
+       THEN (p_com - p_sem)
+            / sqrt(p_pool * (1 - p_pool)
+                   * (1.0 / nullif(n_com, 0) + 1.0 / nullif(n_sem, 0)))
+  END AS z_score
+FROM calc
+;
+
+
+/* =============================================================================
+   SEÇÃO 05  EXPERIMENTO NATURAL, CONCORDÂNCIA DE TELEFONE
+   =============================================================================
+   Compara a entrega quando o CRM usou, por coincidência, o telefone de ranking
+   1 do Golden Record contra quando usou outro número.
+
+   A ressalva honesta do desenho é que clientes cujos telefones coincidem entre
+   fontes independentes podem ter cadastro mais estável. As seções 05.2, 06 e 08
+   atacam essa ressalva controlando por campanha, por pessoa e por recortes
+   alternativos.
+
+   As views desta seção guardam valores brutos, em fração. O arredondamento
+   acontece apenas no resumo executivo.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_res_05_bruto AS
+WITH agg AS (
+  SELECT
+    grupo,
+    sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END)        AS n1,
+    sum(CASE WHEN concordante = 1 THEN entregue ELSE 0 END) AS k1,
+    sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END)        AS n0,
+    sum(CASE WHEN concordante = 0 THEN entregue ELSE 0 END) AS k0
+  FROM vt_experimento
+  GROUP BY grupo
+),
+calc AS (
+  SELECT
+    *,
+    k1 / nullif(n1, 0)             AS p1,
+    k0 / nullif(n0, 0)             AS p0,
+    (k1 + k0) / nullif(n1 + n0, 0) AS p_pool
+  FROM agg
+),
+z AS (
+  SELECT
+    *,
+    (p1 - p0) / sqrt(p_pool * (1 - p_pool)
+                     * (1.0 / nullif(n1, 0) + 1.0 / nullif(n0, 0)))      AS z_score,
+    sqrt(p1 * (1 - p1) / nullif(n1, 0) + p0 * (1 - p0) / nullif(n0, 0))  AS se_diff
+  FROM calc
+)
+SELECT
+  z.*,
+  wilson_inf(z.k1, z.n1) AS ic_inf_conc,
+  wilson_sup(z.k1, z.n1) AS ic_sup_conc,
+  wilson_inf(z.k0, z.n0) AS ic_inf_disc,
+  wilson_sup(z.k0, z.n0) AS ic_sup_disc,
+  z.p1 - z.p0            AS diferenca,
+  (z.k1 / nullif(z.n1 - z.k1, 0))
+    / nullif(z.k0 / nullif(z.n0 - z.k0, 0), 0) AS odds_ratio_bruta,
+  p_valor_bilateral(z.z_score)                 AS p_valor
+FROM z
+;
+
+
+/* -----------------------------------------------------------------------------
+   05.2  ESTIMADOR ESTRATIFICADO POR CAMPANHA
+
+   Cochran, Mantel e Haenszel. Refaz a comparação dentro de cada campanha e
+   combina, ponderando pelo tamanho do estrato. Neutraliza qualquer diferença
+   entre campanhas, como período, mensagem e público.
+
+   O intervalo da razão de chances usa a variância de Robins, Breslow e
+   Greenland, consistente tanto para poucos estratos grandes quanto para muitos
+   estratos pequenos.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_estratos_campanha AS
+SELECT
+  grupo,
+  campanha,
+  CAST(sum(CASE WHEN concordante = 1 AND entregue = 1 THEN 1 ELSE 0 END) AS DOUBLE) AS a,
+  CAST(sum(CASE WHEN concordante = 1 AND entregue = 0 THEN 1 ELSE 0 END) AS DOUBLE) AS b,
+  CAST(sum(CASE WHEN concordante = 0 AND entregue = 1 THEN 1 ELSE 0 END) AS DOUBLE) AS c,
+  CAST(sum(CASE WHEN concordante = 0 AND entregue = 0 THEN 1 ELSE 0 END) AS DOUBLE) AS d
+FROM vt_experimento
+GROUP BY grupo, campanha
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_05_estratificado AS
+WITH s AS (
+  SELECT
+    e.*,
+    a + b AS n1, c + d AS n0, a + c AS m1, b + d AS m0, a + b + c + d AS n
+  FROM vt_estratos_campanha e
+  CROSS JOIN vt_param p
+  WHERE a + b > 0 AND c + d > 0 AND a + b + c + d >= p.min_n_estrato
+),
+t AS (
+  SELECT
+    *,
+    n1 * m1 / n                           AS e_a,
+    n1 * n0 * m1 * m0 / (n * n * (n - 1)) AS v_a,
+    a * d / n                             AS r_k,
+    b * c / n                             AS s_k,
+    (a + d) / n                           AS p_k,
+    (b + c) / n                           AS q_k,
+    n1 * n0 / n                           AS w_rd,
+    (a / n1) - (c / n0)                   AS rd_k
+  FROM s
+),
+agg AS (
+  SELECT
+    grupo,
+    count(*)                                AS n_estratos,
+    sum(n)                                  AS n_envios,
+    sum(a)                                  AS soma_a,
+    sum(e_a)                                AS soma_e_a,
+    sum(v_a)                                AS soma_v_a,
+    sum(r_k)                                AS soma_r,
+    sum(s_k)                                AS soma_s,
+    sum(p_k * r_k)                          AS soma_pr,
+    sum(p_k * s_k + q_k * r_k)              AS soma_ps_qr,
+    sum(q_k * s_k)                          AS soma_qs,
+    sum(w_rd * rd_k) / nullif(sum(w_rd), 0) AS rd_mh
+  FROM t
+  GROUP BY grupo
+),
+calc AS (
+  SELECT
+    *,
+    soma_r / nullif(soma_s, 0)                        AS or_mh,
+    power(soma_a - soma_e_a, 2) / nullif(soma_v_a, 0) AS chi2,
+    soma_pr / nullif(2 * soma_r * soma_r, 0)
+      + soma_ps_qr / nullif(2 * soma_r * soma_s, 0)
+      + soma_qs / nullif(2 * soma_s * soma_s, 0)      AS var_ln_or
+  FROM agg
+)
+SELECT
+  grupo,
+  n_estratos                                       AS campanhas_no_teste,
+  CAST(n_envios AS BIGINT)                         AS envios_no_teste,
+  rd_mh                                            AS diferenca,
+  or_mh                                            AS odds_ratio,
+  exp(ln(or_mh) - 1.959964 * sqrt(var_ln_or))      AS or_ic_inf,
+  exp(ln(or_mh) + 1.959964 * sqrt(var_ln_or))      AS or_ic_sup,
+  chi2,
+  p_valor_qui2_1gl(chi2)                           AS p_valor
+FROM calc
+;
+
+CREATE OR REPLACE TEMP VIEW vt_taxa_por_campanha AS
+SELECT
+  grupo,
+  campanha,
+  a + b                                    AS n_concordante,
+  CASE WHEN a + b > 0 THEN a / (a + b) END AS taxa_concordante,
+  c + d                                    AS n_discordante,
+  CASE WHEN c + d > 0 THEN c / (c + d) END AS taxa_discordante
+FROM vt_estratos_campanha
+;
+
+
+/* =============================================================================
+   SEÇÃO 06  DESENHO PAREADO DENTRO DO MESMO CLIENTE
+   =============================================================================
+   Compara o mesmo CPF consigo mesmo, em um momento com o telefone do Golden
+   Record e em outro com um número diferente. Qualquer característica fixa da
+   pessoa é idêntica nos dois lados, e o que resta como explicação da diferença
+   é o telefone.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_pareado_cpf AS
+WITH por_cpf AS (
+  SELECT
+    grupo,
+    cpf,
+    sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END) AS n_conc,
+    sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END) AS n_disc,
+    avg(CASE WHEN concordante = 1 THEN entregue END) AS taxa_conc,
+    avg(CASE WHEN concordante = 0 THEN entregue END) AS taxa_disc
+  FROM vt_experimento
+  GROUP BY grupo, cpf
+)
+SELECT * FROM por_cpf WHERE n_conc > 0 AND n_disc > 0
+;
+
+CREATE OR REPLACE TEMP VIEW vt_pareado_um_por_braco AS
+WITH selecionado AS (
+  SELECT e.grupo, e.cpf, e.concordante, e.entregue
+  FROM vt_experimento e
+  JOIN vt_pareado_cpf p ON e.grupo = p.grupo AND e.cpf = p.cpf
+  QUALIFY row_number() OVER (
+    PARTITION BY e.grupo, e.cpf, e.concordante
+    ORDER BY xxhash64(e.cpf, e.campanha, e.telefone_crm)
+  ) = 1
+)
+SELECT
+  grupo,
+  cpf,
+  max(CASE WHEN concordante = 1 THEN entregue END) AS entregue_gr,
+  max(CASE WHEN concordante = 0 THEN entregue END) AS entregue_outro
+FROM selecionado
+GROUP BY grupo, cpf
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_06_pareado AS
+WITH tab AS (
+  SELECT
+    grupo,
+    count(*)                                                                AS n_pares,
+    sum(CASE WHEN entregue_gr = 1 AND entregue_outro = 1 THEN 1 ELSE 0 END) AS ambos,
+    sum(CASE WHEN entregue_gr = 1 AND entregue_outro = 0 THEN 1 ELSE 0 END) AS so_gr,
+    sum(CASE WHEN entregue_gr = 0 AND entregue_outro = 1 THEN 1 ELSE 0 END) AS so_outro,
+    sum(CASE WHEN entregue_gr = 0 AND entregue_outro = 0 THEN 1 ELSE 0 END) AS nenhum,
+    avg(entregue_gr)                                                        AS taxa_gr,
+    avg(entregue_outro)                                                     AS taxa_outro
+  FROM vt_pareado_um_por_braco
+  GROUP BY grupo
+)
+SELECT
+  *,
+  taxa_gr - taxa_outro AS diferenca,
+  CASE WHEN so_gr + so_outro > 0
+       THEN power(so_gr - so_outro, 2) / (so_gr + so_outro) END AS chi2,
+  p_valor_qui2_1gl(
+    CASE WHEN so_gr + so_outro > 0
+         THEN power(so_gr - so_outro, 2) / (so_gr + so_outro) END)          AS p_valor
+FROM tab
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_06_mesma_campanha AS
+WITH pares AS (
+  SELECT
+    grupo, cpf, campanha,
+    max(CASE WHEN concordante = 1 THEN entregue END) AS entregue_gr,
+    max(CASE WHEN concordante = 0 THEN entregue END) AS entregue_outro
+  FROM vt_experimento
+  GROUP BY grupo, cpf, campanha
+  HAVING max(CASE WHEN concordante = 1 THEN 1 ELSE 0 END) = 1
+     AND max(CASE WHEN concordante = 0 THEN 1 ELSE 0 END) = 1
+),
+tab AS (
+  SELECT
+    grupo,
+    count(*)                                                                AS n_pares,
+    sum(CASE WHEN entregue_gr = 1 AND entregue_outro = 0 THEN 1 ELSE 0 END) AS so_gr,
+    sum(CASE WHEN entregue_gr = 0 AND entregue_outro = 1 THEN 1 ELSE 0 END) AS so_outro,
+    avg(entregue_gr)                                                        AS taxa_gr,
+    avg(entregue_outro)                                                     AS taxa_outro
+  FROM pares
+  GROUP BY grupo
+)
+SELECT
+  *,
+  taxa_gr - taxa_outro AS diferenca,
+  p_valor_qui2_1gl(
+    CASE WHEN so_gr + so_outro > 0
+         THEN power(so_gr - so_outro, 2) / (so_gr + so_outro) END)          AS p_valor
+FROM tab
+;
+
+
+/* =============================================================================
+   SEÇÃO 07  CONTRAFACTUAL DOS INSUCESSOS
+   =============================================================================
+   Dado um SMS que não foi entregue, o telefone do Golden Record seria diferente
+   do que foi usado? E se fosse, quantas entregas teriam sido recuperadas?
+
+   Cinco cenários, do otimista ao conservador, sempre com as perdas descontadas.
+   Adotar o Golden Record também substitui números que hoje funcionam, e cada
+   cenário estima quantas entregas atuais ficariam em risco.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_gr_observado_no_crm AS
+SELECT
+  grupo,
+  cpf,
+  count(*)      AS envios_no_telefone_gr,
+  max(entregue) AS gr_alguma_entrega,
+  avg(entregue) AS gr_taxa_entrega
+FROM vt_experimento
+WHERE concordante = 1
+GROUP BY grupo, cpf
+;
+
+CREATE OR REPLACE TEMP VIEW vt_taxa_global_grupo AS
+SELECT
+  grupo,
+  avg(CASE WHEN concordante = 1 THEN entregue END) AS taxa_concordante_global,
+  avg(CASE WHEN concordante = 0 THEN entregue END) AS taxa_discordante_global
+FROM vt_experimento
+GROUP BY grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_envios_gr_diferente AS
+SELECT
+  e.grupo,
+  e.cpf,
+  e.campanha,
+  e.id_briefing,
+  e.promocional,
+  e.segmento,
+  e.entregue,
+  o.gr_taxa_entrega,
+  CASE
+    WHEN o.cpf IS NULL           THEN 'GR_NUNCA_ACIONADO'
+    WHEN o.gr_alguma_entrega = 1 THEN 'GR_ACIONADO_E_ENTREGOU'
+    ELSE                              'GR_ACIONADO_SEM_ENTREGA'
+  END                                                     AS evidencia_direta,
+  coalesce(t.taxa_concordante, g.taxa_concordante_global) AS taxa_calibracao_campanha,
+  g.taxa_concordante_global
+FROM vt_experimento e
+LEFT JOIN vt_gr_observado_no_crm o ON e.grupo = o.grupo AND e.cpf = o.cpf
+LEFT JOIN vt_taxa_por_campanha t   ON e.grupo = t.grupo AND e.campanha = t.campanha
+JOIN vt_taxa_global_grupo g        ON e.grupo = g.grupo
+WHERE e.classe_concordancia = 'DIFERENTE'
+;
+
+/* Insumo do resumo executivo: quanto do universo candidato depende de
+   extrapolação e qual a taxa observada do telefone do Golden Record entre os
+   clientes em que ele já foi acionado. Esses dois números explicam o
+   comportamento do cenário de evidência extrapolada. */
+CREATE OR REPLACE TEMP VIEW vt_res_07_evidencia AS
+SELECT
+  grupo,
+  count(*)                                                                    AS candidatos,
+  sum(CASE WHEN evidencia_direta = 'GR_NUNCA_ACIONADO' THEN 1 ELSE 0 END)     AS sem_historico,
+  sum(CASE WHEN evidencia_direta = 'GR_NUNCA_ACIONADO' THEN 1 ELSE 0 END)
+    / nullif(count(*), 0)                                                     AS fracao_sem_historico,
+  sum(CASE WHEN evidencia_direta = 'GR_ACIONADO_E_ENTREGOU' THEN 1 ELSE 0 END) AS com_entrega_provada,
+  avg(CASE WHEN evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica,
+  max(taxa_historica_sucessos)                                                AS taxa_historica_sucessos
+FROM vt_envios_gr_diferente d
+LEFT JOIN (
+  SELECT grupo AS g2,
+         avg(CASE WHEN evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica_sucessos
+  FROM vt_envios_gr_diferente WHERE entregue = 1 GROUP BY grupo
+) su ON d.grupo = su.g2
+WHERE d.entregue = 0
+GROUP BY d.grupo
+;
+
+/* Ponte entre os dois escopos: o saldo do cenário central aberto por segmento.
+   PROMOCIONAL são os briefings da seção 00.5; TRANSACIONAL, todos os demais.
+   O mesmo saldo é lido em mídia na seção 09 e, só para o promocional, em
+   receita na seção 10. */
+CREATE OR REPLACE TEMP VIEW vt_res_07_saldo_segmento AS
+SELECT
+  grupo,
+  segmento,
+  count(DISTINCT id_briefing)                                              AS briefings,
+  sum(CASE WHEN entregue = 0 THEN 1 ELSE 0 END)                            AS candidatos,
+  sum(CASE WHEN entregue = 0 THEN taxa_calibracao_campanha ELSE 0 END)     AS recuperadas,
+  sum(CASE WHEN entregue = 1 THEN 1 ELSE 0 END)                            AS em_risco,
+  sum(CASE WHEN entregue = 1 THEN 1 - taxa_calibracao_campanha ELSE 0 END) AS perdidas,
+  sum(CASE WHEN entregue = 0 THEN taxa_calibracao_campanha ELSE 0 END)
+    - sum(CASE WHEN entregue = 1 THEN 1 - taxa_calibracao_campanha ELSE 0 END) AS entregas_liquidas
+FROM vt_envios_gr_diferente
+GROUP BY grupo, segmento
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_07_ganhos AS
+WITH base AS (
+  SELECT
+    grupo,
+    count(*)                                                                       AS candidatos,
+    max(taxa_concordante_global)                                                   AS taxa_global,
+    sum(taxa_calibracao_campanha)                                                  AS recup_campanha,
+    sum(CASE WHEN evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN 1 ELSE 0 END)       AS com_historico,
+    avg(CASE WHEN evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica,
+    sum(CASE WHEN evidencia_direta = 'GR_ACIONADO_E_ENTREGOU' THEN 1 ELSE 0 END)   AS entrega_provada
+  FROM vt_envios_gr_diferente
+  WHERE entregue = 0
+  GROUP BY grupo
+)
+SELECT grupo, 1 AS ordem, 'TETO' AS cenario, candidatos,
+       CAST(1.0 AS DOUBLE) AS taxa_aplicada, CAST(candidatos AS DOUBLE) AS recuperadas
+FROM base
+UNION ALL
+SELECT grupo, 2, 'CALIBRADO_GLOBAL', candidatos, taxa_global, candidatos * taxa_global
+FROM base
+UNION ALL
+SELECT grupo, 3, 'CALIBRADO_CAMPANHA', candidatos,
+       recup_campanha / nullif(candidatos, 0), recup_campanha
+FROM base
+UNION ALL
+SELECT grupo, 4, 'EVIDENCIA_EXTRAPOLADA', candidatos, taxa_historica, candidatos * taxa_historica
+FROM base
+UNION ALL
+SELECT grupo, 5, 'PISO_OBSERVADO', com_historico,
+       entrega_provada / nullif(com_historico, 0), CAST(entrega_provada AS DOUBLE)
+FROM base
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_07_perdas AS
+WITH base AS (
+  SELECT
+    grupo,
+    count(*)                                                                        AS em_risco,
+    max(taxa_concordante_global)                                                    AS taxa_global,
+    sum(1 - taxa_calibracao_campanha)                                               AS perda_campanha,
+    avg(CASE WHEN evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica,
+    sum(CASE WHEN evidencia_direta = 'GR_ACIONADO_SEM_ENTREGA' THEN 1 ELSE 0 END)   AS perda_comprovada
+  FROM vt_envios_gr_diferente
+  WHERE entregue = 1
+  GROUP BY grupo
+)
+SELECT grupo, 1 AS ordem, em_risco, CAST(0.0 AS DOUBLE) AS perdidas FROM base
+UNION ALL SELECT grupo, 2, em_risco, em_risco * (1 - taxa_global) FROM base
+UNION ALL SELECT grupo, 3, em_risco, perda_campanha FROM base
+UNION ALL SELECT grupo, 4, em_risco, em_risco * (1 - taxa_historica) FROM base
+UNION ALL SELECT grupo, 5, em_risco, CAST(perda_comprovada AS DOUBLE) FROM base
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_07_saldo AS
+SELECT
+  g.grupo,
+  g.ordem,
+  g.cenario,
+  g.candidatos,
+  g.taxa_aplicada,
+  g.recuperadas,
+  p.em_risco,
+  p.perdidas,
+  g.recuperadas - p.perdidas                                AS entregas_liquidas,
+  (g.recuperadas - p.perdidas) / nullif(v.disparos_com_gr, 0) AS pp_incremental
+FROM vt_res_07_ganhos g
+JOIN vt_res_07_perdas p ON g.grupo = p.grupo AND g.ordem = p.ordem
+JOIN vt_res_04_volume v ON g.grupo = v.grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_07_cpfs AS
+WITH status_cpf AS (
+  SELECT
+    grupo,
+    cpf,
+    max(entregue)                                                                       AS alguma_entrega,
+    max(CASE WHEN entregue = 0 AND classe_concordancia = 'DIFERENTE' THEN 1 ELSE 0 END) AS insucesso_divergente,
+    max(CASE WHEN concordante = 1 THEN 1 ELSE 0 END)                                    AS gr_acionado,
+    max(CASE WHEN concordante = 1 THEN entregue ELSE 0 END)                             AS gr_entregou
+  FROM vt_experimento
+  GROUP BY grupo, cpf
+)
+SELECT
+  grupo,
+  count(*)                                                                     AS clientes_com_gr,
+  sum(CASE WHEN alguma_entrega = 0 THEN 1 ELSE 0 END)                          AS sem_nenhuma_entrega,
+  avg(CASE WHEN alguma_entrega = 0 THEN 1 ELSE 0 END)                          AS fracao_sem_entrega,
+  sum(CASE WHEN alguma_entrega = 0 AND insucesso_divergente = 1 AND gr_acionado = 0
+           THEN 1 ELSE 0 END)                                                  AS com_telefone_novo,
+  sum(CASE WHEN alguma_entrega = 0 AND insucesso_divergente = 1 AND gr_acionado = 1
+           THEN 1 ELSE 0 END)                                                  AS gr_ja_falhou,
+  sum(CASE WHEN alguma_entrega = 1 AND insucesso_divergente = 1 AND gr_entregou = 1
+           THEN 1 ELSE 0 END)                                                  AS gr_comprovado
+FROM status_cpf
+GROUP BY grupo
+;
+
+
+/* =============================================================================
+   SEÇÃO 08  TESTES DE ROBUSTEZ
+   =============================================================================
+   Verifica se o efeito depende de uma campanha específica, de uma regra de
+   comparação ou de um perfil de cliente.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_res_08_por_campanha AS
+WITH s AS (
+  SELECT e.*, e.a + e.b AS n1, e.c + e.d AS n0
+  FROM vt_estratos_campanha e
+  CROSS JOIN vt_param p
+  WHERE e.a + e.b >= p.min_envios_braco AND e.c + e.d >= p.min_envios_braco
+),
+calc AS (
+  SELECT *, a / nullif(n1, 0) AS p1, c / nullif(n0, 0) AS p0 FROM s
+)
+SELECT
+  grupo,
+  campanha,
+  n1, n0, p1, p0,
+  CASE WHEN p1 > p0 THEN 'GOLDEN_RECORD'
+       WHEN p1 < p0 THEN 'CRM'
+       ELSE 'EMPATE' END AS vencedor
+FROM calc
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_08_teste_sinal AS
+WITH t AS (
+  SELECT
+    grupo,
+    count(*)                                                    AS id_briefings,
+    sum(CASE WHEN vencedor = 'GOLDEN_RECORD' THEN 1 ELSE 0 END) AS vitorias,
+    sum(CASE WHEN vencedor = 'CRM' THEN 1 ELSE 0 END)           AS derrotas,
+    sum(CASE WHEN vencedor = 'EMPATE' THEN 1 ELSE 0 END)        AS empates
+  FROM vt_res_08_por_campanha
+  GROUP BY grupo
+)
+SELECT
+  *,
+  vitorias / nullif(vitorias + derrotas, 0) AS fracao_vitorias,
+  p_valor_bilateral(
+    CASE WHEN vitorias + derrotas > 0
+         THEN (vitorias - (vitorias + derrotas) / 2.0)
+              / sqrt((vitorias + derrotas) / 4.0) END) AS p_valor
+FROM t
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_08_sem_maior AS
+WITH maior AS (
+  SELECT grupo, campanha
+  FROM vt_campanha_volume
+  QUALIFY row_number() OVER (PARTITION BY grupo ORDER BY n_envios DESC) = 1
+),
+agg AS (
+  SELECT
+    e.grupo,
+    max(m.campanha)                                            AS campanha_excluida,
+    sum(CASE WHEN e.concordante = 1 THEN 1 ELSE 0 END)         AS n1,
+    sum(CASE WHEN e.concordante = 1 THEN e.entregue ELSE 0 END) AS k1,
+    sum(CASE WHEN e.concordante = 0 THEN 1 ELSE 0 END)         AS n0,
+    sum(CASE WHEN e.concordante = 0 THEN e.entregue ELSE 0 END) AS k0
+  FROM vt_experimento e
+  JOIN maior m ON e.grupo = m.grupo
+  WHERE e.campanha <> m.campanha
+  GROUP BY e.grupo
+)
+SELECT
+  grupo,
+  campanha_excluida,
+  k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca
+FROM agg
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_08_regra_exata AS
+WITH agg AS (
+  SELECT
+    grupo,
+    sum(CASE WHEN concordante_exato = 1 THEN 1 ELSE 0 END)        AS n1,
+    sum(CASE WHEN concordante_exato = 1 THEN entregue ELSE 0 END) AS k1,
+    sum(CASE WHEN concordante_exato = 0 THEN 1 ELSE 0 END)        AS n0,
+    sum(CASE WHEN concordante_exato = 0 THEN entregue ELSE 0 END) AS k0
+  FROM vt_experimento
+  GROUP BY grupo
+)
+SELECT grupo, k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca FROM agg
+;
+
+
+/* =============================================================================
+   SEÇÃO 09  VALUATION PELO CUSTO DE DISPARO
+   =============================================================================
+   Primeira lente financeira, e a mais conservadora, porque depende de uma única
+   premissa: o preço de um disparo.
+
+   A ideia é simples. Um SMS que não chega é dinheiro gasto sem contrapartida.
+   Se o Golden Record aumenta a taxa de entrega, o mesmo orçamento passa a
+   comprar mais entregas, e o custo por entrega cai. As entregas adicionais
+   podem então ser precificadas pelo que custaria comprá-las hoje, em mídia.
+
+   Esta lente não assume nada sobre conversão nem sobre receita. É o piso do
+   valuation, e serve para a conversa com quem não aceita premissas comerciais.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_res_09_custo_atual AS
+SELECT
+  v.grupo,
+  v.disparos,
+  v.entregas,
+  v.insucessos,
+  v.taxa_entrega,
+  gp.custo_sms,
+  v.disparos   * gp.custo_sms                          AS custo_total,
+  v.entregas   * gp.custo_sms                          AS custo_produtivo,
+  v.insucessos * gp.custo_sms                          AS custo_desperdicado,
+  v.insucessos / nullif(v.disparos, 0)                 AS fracao_desperdicada,
+  gp.custo_sms / nullif(v.taxa_entrega, 0)             AS custo_por_entrega,
+  gp.custo_sms / nullif(b.p1, 0)                       AS custo_por_entrega_concordante,
+  gp.custo_sms / nullif(b.p0, 0)                       AS custo_por_entrega_discordante,
+  gp.custo_sms / nullif(b.p0, 0)
+    - gp.custo_sms / nullif(b.p1, 0)                   AS sobrecusto_por_entrega
+FROM vt_res_04_volume v
+JOIN vt_grupo_param gp ON v.grupo = gp.grupo
+JOIN vt_res_05_bruto b ON v.grupo = b.grupo
+;
+
+/* Valor equivalente de mídia: o que custaria comprar hoje, em disparos
+   adicionais, o mesmo número de entregas que o Golden Record entrega de graça.
+   custo_por_entrega_projetado mostra a queda do custo unitário de entrega. */
+CREATE OR REPLACE TEMP VIEW vt_res_09_custo_cenario AS
+SELECT
+  s.grupo,
+  s.ordem,
+  s.cenario,
+  s.entregas_liquidas,
+  c.custo_por_entrega,
+  s.entregas_liquidas * c.custo_por_entrega                          AS valor_equivalente_midia,
+  c.custo_total / nullif(c.entregas + s.entregas_liquidas, 0)        AS custo_por_entrega_projetado,
+  c.custo_por_entrega
+    - c.custo_total / nullif(c.entregas + s.entregas_liquidas, 0)    AS queda_custo_por_entrega
+FROM vt_res_07_saldo s
+JOIN vt_res_09_custo_atual c ON s.grupo = c.grupo
+;
+
+/* Leitura de mídia por segmento. Nas campanhas transacionais o ganho é só este:
+   parar de pagar por SMS que não chega e passar a entregar. Nos briefings
+   promocionais o mesmo saldo físico ganha, na seção 10, a leitura de receita. */
+CREATE OR REPLACE TEMP VIEW vt_res_09_segmento AS
+WITH volume AS (
+  SELECT
+    grupo,
+    segmento,
+    count(DISTINCT id_briefing)                     AS briefings,
+    count(*)                                        AS disparos,
+    sum(entregue)                                   AS entregas,
+    count(*) - sum(entregue)                        AS insucessos,
+    sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)         AS disparos_com_gr
+  FROM vt_base_grupo
+  GROUP BY grupo, segmento
+)
+SELECT
+  v.grupo,
+  v.segmento,
+  v.briefings,
+  v.disparos,
+  v.entregas,
+  v.insucessos,
+  v.disparos_com_gr,
+  v.disparos / nullif(c.disparos, 0)                       AS parcela_disparos,
+  v.insucessos * c.custo_sms                               AS custo_desperdicado,
+  coalesce(sg.candidatos, 0)                               AS candidatos,
+  coalesce(sg.recuperadas, 0)                              AS recuperadas,
+  coalesce(sg.em_risco, 0)                                 AS em_risco,
+  coalesce(sg.perdidas, 0)                                 AS perdidas,
+  coalesce(sg.entregas_liquidas, 0)                        AS entregas_liquidas,
+  coalesce(sg.entregas_liquidas, 0) / nullif(v.disparos_com_gr, 0) AS pp_incremental,
+  coalesce(sg.entregas_liquidas, 0) * c.custo_por_entrega  AS valor_equivalente_midia
+FROM volume v
+JOIN vt_res_09_custo_atual c ON v.grupo = c.grupo
+LEFT JOIN vt_res_07_saldo_segmento sg ON v.grupo = sg.grupo AND v.segmento = sg.segmento
+;
+
+/* Ponte entre os dois escopos da saída: quanto da janela e quanto do ganho
+   físico está nos briefings promocionais, que são os únicos com leitura de
+   receita. briefings_parametrizados conta a lista da seção 00.5; briefings_promo
+   conta os que de fato têm disparo na janela. */
+CREATE OR REPLACE TEMP VIEW vt_res_10_ponte AS
+SELECT
+  sg.grupo,
+  sum(sg.briefings)                                                          AS briefings_total,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.briefings  ELSE 0 END)  AS briefings_promo,
+  sum(CASE WHEN sg.segmento = 'TRANSACIONAL' THEN sg.briefings  ELSE 0 END)  AS briefings_transacional,
+  max(pb.briefings_parametrizados)                                           AS briefings_parametrizados,
+  sum(sg.disparos)                                                           AS disparos_total,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.disparos   ELSE 0 END)  AS disparos_promo,
+  sum(CASE WHEN sg.segmento = 'TRANSACIONAL' THEN sg.disparos   ELSE 0 END)  AS disparos_transacional,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.disparos_com_gr ELSE 0 END) AS disparos_com_gr_promo,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.entregas   ELSE 0 END)  AS entregas_promo,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.insucessos ELSE 0 END)  AS insucessos_promo,
+  sum(CASE WHEN sg.segmento = 'TRANSACIONAL' THEN sg.insucessos ELSE 0 END)  AS insucessos_transacional,
+  sum(sg.entregas_liquidas)                                                  AS liquidas_total,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.entregas_liquidas ELSE 0 END) AS liquidas_promo,
+  sum(CASE WHEN sg.segmento = 'TRANSACIONAL' THEN sg.entregas_liquidas ELSE 0 END) AS liquidas_transacional,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.disparos   ELSE 0 END)
+    / nullif(sum(sg.disparos), 0)                                            AS parcela_disparos_promo,
+  sum(CASE WHEN sg.segmento = 'PROMOCIONAL'  THEN sg.entregas_liquidas ELSE 0 END)
+    / nullif(sum(sg.entregas_liquidas), 0)                                   AS parcela_liquidas_promo
+FROM vt_res_09_segmento sg
+CROSS JOIN (SELECT count(DISTINCT id_briefing) AS briefings_parametrizados FROM vt_param_briefing) pb
+GROUP BY sg.grupo
+;
+
+
+/* =============================================================================
+   SEÇÃO 10  VALUATION PELA CONVERSÃO
+   =============================================================================
+   Segunda lente financeira. Assume que uma fração das entregas gera a conversão
+   de interesse e que cada conversão tem um retorno médio.
+
+   ESCOPO DESTA SEÇÃO
+   Apenas os briefings promocionais, isto é, os listados na seção 00.5. São os
+   únicos com taxa de conversão e tíquete conhecidos. As campanhas
+   transacionais ficam fora desta lente de propósito: o valor delas já foi
+   medido na seção 09, em mídia, e a ponte entre os dois escopos está em
+   vt_res_10_ponte.
+
+   A CONTA É FEITA BRIEFING A BRIEFING E DEPOIS SOMADA
+   Cada briefing do escopo tem taxa de conversão e tíquete próprios, informados
+   na seção 00.5. As entregas que o Golden Record recupera em cada briefing são
+   convertidas pela taxa daquele briefing e pelo tíquete daquele briefing, e só
+   então os briefings são somados. Nenhuma premissa única é aplicada ao total.
+
+   Os cinco cenários da seção 07 são recalculados dentro de cada briefing com
+   os mesmos ingredientes, restritos ao segmento promocional. O cenário de
+   evidência extrapolada usa as taxas históricas do próprio briefing quando
+   existem, com reserva na taxa do segmento, e aplica a mesma convenção da
+   seção 07: taxa medida entre insucessos para as recuperações e taxa medida
+   entre sucessos para as perdas. Assim o sinal deste cenário é o mesmo nas
+   duas lentes.
+
+   As views vt_res_10_conversao_atual, vt_res_10_conversao_cenario e
+   vt_res_10_sensibilidade expõem os mesmos campos de antes, agora alimentados
+   pela soma dos briefings. Onde havia uma taxa única, passa a existir a taxa
+   efetiva, que é a média das taxas dos briefings ponderada pelas entregas.
+
+   ESTA LENTE NÃO SE SOMA À ANTERIOR
+   As duas medem o mesmo conjunto de entregas adicionais, por réguas
+   diferentes. A lente de custo diz quanto valeria comprar essas entregas em
+   mídia. A lente de conversão diz quanto elas geram de receita. Somar as duas
+   contaria o mesmo ganho duas vezes.
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   10.1  VOLUME E ECONOMIA POR BRIEFING
+
+   Um briefing pode reunir mais de uma campanha. O volume é somado sobre as
+   campanhas do briefing, e a economia vem da seção 00.5 com a regra de reserva
+   declarada em origem_taxa e origem_ticket. Só entram briefings promocionais.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_briefing_volume AS
+SELECT
+  grupo,
+  id_briefing,
+  count(*)                                        AS n_envios,
+  sum(entregue)                                   AS n_entregues,
+  sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)         AS n_com_gr,
+  count(DISTINCT campanha)                        AS n_campanhas
+FROM vt_base_grupo
+WHERE promocional
+GROUP BY grupo, id_briefing
+;
+
+CREATE OR REPLACE TEMP VIEW vt_briefing_economia AS
+SELECT
+  v.grupo,
+  v.id_briefing,
+  v.n_campanhas,
+  v.n_envios,
+  v.n_entregues,
+  v.n_com_gr,
+  v.n_envios - v.n_entregues                             AS n_insucessos,
+  coalesce(p.conversao_pct / 100.0,
+           p.conversoes_observadas / nullif(v.n_entregues, 0),
+           gp.taxa_conversao)                            AS taxa_conversao,
+  coalesce(p.ticket_medio, gp.valor_conversao)           AS ticket_medio,
+  CASE WHEN p.conversao_pct IS NOT NULL          THEN 'INFORMADA'
+       WHEN p.conversoes_observadas IS NOT NULL  THEN 'DERIVADA_DAS_CONVERSOES'
+       ELSE                                           'RESERVA_DO_GRUPO' END AS origem_taxa,
+  CASE WHEN p.ticket_medio IS NOT NULL THEN 'INFORMADO'
+       ELSE 'RESERVA_DO_GRUPO' END                      AS origem_ticket,
+  gp.custo_sms
+FROM vt_briefing_volume v
+LEFT JOIN vt_param_briefing p ON v.id_briefing = p.id_briefing
+JOIN vt_grupo_param gp          ON v.grupo = gp.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.2  CENÁRIOS POR BRIEFING
+
+   Mesma lógica da seção 07, aplicada dentro de cada briefing promocional.
+   vt_briefing_base guarda os ingredientes por briefing e é reaproveitada pela
+   faixa estatística da seção 11.9.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_07_evidencia_segmento AS
+SELECT
+  grupo,
+  segmento,
+  avg(CASE WHEN entregue = 0 AND evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica,
+  avg(CASE WHEN entregue = 1 AND evidencia_direta <> 'GR_NUNCA_ACIONADO' THEN gr_taxa_entrega END) AS taxa_historica_sucessos,
+  sum(CASE WHEN entregue = 0 THEN 1 ELSE 0 END)                                                    AS candidatos,
+  sum(CASE WHEN entregue = 0 AND evidencia_direta = 'GR_NUNCA_ACIONADO' THEN 1 ELSE 0 END)          AS sem_historico,
+  sum(CASE WHEN entregue = 0 AND evidencia_direta = 'GR_ACIONADO_E_ENTREGOU' THEN 1 ELSE 0 END)     AS com_entrega_provada,
+  sum(CASE WHEN entregue = 0 AND evidencia_direta = 'GR_NUNCA_ACIONADO' THEN 1 ELSE 0 END)
+    / nullif(sum(CASE WHEN entregue = 0 THEN 1 ELSE 0 END), 0)                                     AS fracao_sem_historico
+FROM vt_envios_gr_diferente
+GROUP BY grupo, segmento
+;
+
+CREATE OR REPLACE TEMP VIEW vt_briefing_base AS
+WITH base AS (
+  SELECT
+    d.grupo,
+    d.id_briefing,
+    sum(CASE WHEN d.entregue = 0 THEN 1 ELSE 0 END)                                AS candidatos,
+    sum(CASE WHEN d.entregue = 0 THEN d.taxa_calibracao_campanha ELSE 0 END)       AS recup_calibrada,
+    max(d.taxa_concordante_global)                                                 AS taxa_global,
+    avg(CASE WHEN d.entregue = 0 AND d.evidencia_direta <> 'GR_NUNCA_ACIONADO'
+             THEN d.gr_taxa_entrega END)                                           AS taxa_hist_briefing,
+    avg(CASE WHEN d.entregue = 1 AND d.evidencia_direta <> 'GR_NUNCA_ACIONADO'
+             THEN d.gr_taxa_entrega END)                                           AS taxa_hist_suc_briefing,
+    sum(CASE WHEN d.entregue = 0 AND d.evidencia_direta = 'GR_ACIONADO_E_ENTREGOU'
+             THEN 1 ELSE 0 END)                                                    AS provada,
+    sum(CASE WHEN d.entregue = 1 THEN 1 ELSE 0 END)                                AS em_risco,
+    sum(CASE WHEN d.entregue = 1 THEN 1 - d.taxa_calibracao_campanha ELSE 0 END)   AS perda_calibrada,
+    sum(CASE WHEN d.entregue = 1 AND d.evidencia_direta = 'GR_ACIONADO_SEM_ENTREGA'
+             THEN 1 ELSE 0 END)                                                    AS perda_provada
+  FROM vt_envios_gr_diferente d
+  WHERE d.promocional
+  GROUP BY d.grupo, d.id_briefing
+)
+SELECT
+  b.*,
+  coalesce(b.taxa_hist_briefing,     ev.taxa_historica)          AS taxa_hist,
+  coalesce(b.taxa_hist_suc_briefing, ev.taxa_historica_sucessos) AS taxa_hist_suc
+FROM base b
+LEFT JOIN vt_res_07_evidencia_segmento ev
+  ON b.grupo = ev.grupo AND ev.segmento = 'PROMOCIONAL'
+;
+
+CREATE OR REPLACE TEMP VIEW vt_briefing_cenarios AS
+SELECT grupo, id_briefing, 1 AS ordem, 'TETO' AS cenario,
+       CAST(candidatos AS DOUBLE) AS recuperadas, CAST(0.0 AS DOUBLE) AS perdidas
+FROM vt_briefing_base
+UNION ALL
+SELECT grupo, id_briefing, 2, 'CALIBRADO_GLOBAL',
+       candidatos * taxa_global, em_risco * (1 - taxa_global)
+FROM vt_briefing_base
+UNION ALL
+SELECT grupo, id_briefing, 3, 'CALIBRADO_CAMPANHA',
+       recup_calibrada, perda_calibrada
+FROM vt_briefing_base
+UNION ALL
+SELECT grupo, id_briefing, 4, 'EVIDENCIA_EXTRAPOLADA',
+       candidatos * coalesce(taxa_hist, 0), em_risco * (1 - coalesce(taxa_hist_suc, taxa_hist, 0))
+FROM vt_briefing_base
+UNION ALL
+SELECT grupo, id_briefing, 5, 'PISO_OBSERVADO',
+       CAST(provada AS DOUBLE), CAST(perda_provada AS DOUBLE)
+FROM vt_briefing_base
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.3  VALUATION POR BRIEFING
+
+   Uma linha por briefing e cenário, com o saldo de entregas convertido pela
+   economia do próprio briefing. É a base da saída 12.3 e da soma que alimenta
+   o bloco E do resumo.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_10_briefing_valuation AS
+SELECT
+  c.grupo,
+  c.id_briefing,
+  c.ordem,
+  c.cenario,
+  e.n_campanhas,
+  e.n_envios,
+  e.n_entregues,
+  e.n_insucessos,
+  e.n_com_gr,
+  c.recuperadas,
+  c.perdidas,
+  c.recuperadas - c.perdidas                                          AS entregas_liquidas,
+  e.taxa_conversao,
+  e.ticket_medio,
+  e.origem_taxa,
+  e.origem_ticket,
+  e.n_entregues * e.taxa_conversao                                    AS conversoes_atuais,
+  e.n_entregues * e.taxa_conversao * e.ticket_medio                   AS receita_atual,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao                     AS conversoes_incrementais,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio    AS receita_incremental,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio
+    / nullif(e.n_entregues * e.taxa_conversao * e.ticket_medio, 0)    AS crescimento_receita,
+  e.n_insucessos * e.custo_sms                                        AS custo_desperdicado,
+  (c.recuperadas - c.perdidas) * e.custo_sms                          AS midia_requalificada
+FROM vt_briefing_cenarios c
+JOIN vt_briefing_economia e ON c.grupo = e.grupo AND c.id_briefing = e.id_briefing
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_10_briefing_ranking AS
+WITH central AS (
+  SELECT *
+  FROM vt_res_10_briefing_valuation
+  WHERE cenario = 'CALIBRADO_CAMPANHA' AND receita_incremental > 0
+),
+ordenado AS (
+  SELECT
+    *,
+    row_number() OVER (PARTITION BY grupo ORDER BY receita_incremental DESC) AS posicao,
+    sum(receita_incremental) OVER (PARTITION BY grupo)                       AS total_positivo,
+    sum(receita_incremental) OVER (
+      PARTITION BY grupo ORDER BY receita_incremental DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)                      AS acumulado
+  FROM central
+)
+SELECT
+  *,
+  receita_incremental / nullif(total_positivo, 0) AS participacao,
+  acumulado / nullif(total_positivo, 0)           AS participacao_acumulada
+FROM ordenado
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.5  DESTAQUES POR BRIEFING PARA O RESUMO
+
+   O bloco E do resumo é consolidado, mas cada linha nomeia os briefings que
+   explicam o número. Esta view calcula, por grupo, quem é o maior, o menor, os
+   três primeiros e os que ficam negativos, no cenário central, para que os
+   textos do resumo citem identificadores e valores reais em vez de médias.
+
+   Como briefing e campanha são um para um, o cenário central por briefing é o
+   mesmo cenário calibrado por campanha da seção 07.
+
+   As listas são limitadas aos primeiros elementos em ordem alfabética do
+   identificador, para que a coluna de exemplo não cresça sem limite quando o
+   escopo tiver muitos briefings.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_10_briefing_destaques AS
+WITH central AS (
+  SELECT *
+  FROM vt_res_10_briefing_valuation
+  WHERE cenario = 'CALIBRADO_CAMPANHA'
+),
+enriquecido AS (
+  SELECT
+    *,
+    entregas_liquidas / nullif(n_com_gr, 0)                                        AS lift_pp,
+    row_number() OVER (PARTITION BY grupo ORDER BY receita_incremental DESC)       AS pos_receita,
+    sum(receita_atual)        OVER (PARTITION BY grupo)                            AS total_receita_atual,
+    sum(conversoes_atuais)    OVER (PARTITION BY grupo)                            AS total_conversoes_atuais,
+    sum(entregas_liquidas)    OVER (PARTITION BY grupo)                            AS total_liquidas,
+    sum(CASE WHEN receita_incremental > 0 THEN receita_incremental ELSE 0 END)
+        OVER (PARTITION BY grupo)                                                  AS total_positivo
+  FROM central
+)
+SELECT
+  grupo,
+  count(*)                                                        AS briefings,
+  array_join(slice(array_sort(collect_list(
+    concat(id_briefing, ' com conversao de ',
+           format_number(100.0 * taxa_conversao, 2), ' por cento e ticket de ',
+           format_number(ticket_medio, 2), ' reais'))), 1, 5), '; ')  AS lista_economia,
+  max_by(id_briefing, receita_atual)                              AS brf_maior_receita_atual,
+  max(receita_atual)                                              AS receita_atual_maior,
+  max(receita_atual) / nullif(max(total_receita_atual), 0)        AS share_receita_atual_maior,
+  max_by(id_briefing, conversoes_atuais)                          AS brf_maior_conversoes_atuais,
+  max(conversoes_atuais) / nullif(max(total_conversoes_atuais), 0) AS share_conversoes_atuais_maior,
+  min_by(id_briefing, taxa_conversao)                             AS brf_menor_taxa,
+  min(taxa_conversao)                                             AS menor_taxa,
+  max_by(id_briefing, taxa_conversao)                             AS brf_maior_taxa,
+  max(taxa_conversao)                                             AS maior_taxa,
+  min_by(id_briefing, ticket_medio)                               AS brf_menor_ticket,
+  min(ticket_medio)                                               AS menor_ticket,
+  max_by(id_briefing, ticket_medio)                               AS brf_maior_ticket,
+  max(ticket_medio)                                               AS maior_ticket,
+  max_by(id_briefing, n_entregues)                                AS brf_maior_volume,
+  max(n_entregues)                                                AS entregas_maior_volume,
+  max_by(id_briefing, recuperadas)                                AS brf_maior_recuperadas,
+  max(recuperadas)                                                AS maior_recuperadas,
+  max_by(id_briefing, perdidas)                                   AS brf_maior_perdidas,
+  max(perdidas)                                                   AS maior_perdidas,
+  max_by(id_briefing, entregas_liquidas)                          AS brf_maior_liquidas,
+  max(entregas_liquidas)                                          AS maior_liquidas,
+  max(entregas_liquidas) / nullif(max(total_liquidas), 0)         AS share_liquidas_maior,
+  max_by(id_briefing, lift_pp)                                    AS brf_maior_lift,
+  max(lift_pp)                                                    AS maior_lift,
+  min_by(id_briefing, lift_pp)                                    AS brf_menor_lift,
+  min(lift_pp)                                                    AS menor_lift,
+  max_by(id_briefing, conversoes_incrementais)                    AS brf_maior_conv_incr,
+  max(conversoes_incrementais)                                    AS maior_conv_incr,
+  max(CASE WHEN pos_receita = 1 THEN id_briefing END)             AS brf_top1,
+  max(CASE WHEN pos_receita = 1 THEN receita_incremental END)     AS receita_top1,
+  max(CASE WHEN pos_receita = 2 THEN id_briefing END)             AS brf_top2,
+  max(CASE WHEN pos_receita = 2 THEN receita_incremental END)     AS receita_top2,
+  max(CASE WHEN pos_receita = 3 THEN id_briefing END)             AS brf_top3,
+  max(CASE WHEN pos_receita = 3 THEN receita_incremental END)     AS receita_top3,
+  max(total_positivo)                                             AS total_positivo,
+  max_by(id_briefing, crescimento_receita)                        AS brf_maior_crescimento,
+  max(crescimento_receita)                                        AS maior_crescimento,
+  sum(CASE WHEN receita_incremental < 0 THEN 1 ELSE 0 END)        AS briefings_negativos,
+  array_join(slice(array_sort(collect_list(
+    CASE WHEN receita_incremental < 0 THEN id_briefing END)), 1, 10), ', ') AS lista_negativos,
+  sum(CASE WHEN receita_incremental < 0 THEN receita_incremental ELSE 0 END) AS receita_negativa,
+  sum(CASE WHEN receita_incremental > 0 THEN receita_incremental ELSE 0 END) AS receita_positiva
+FROM enriquecido
+GROUP BY grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.4  AGREGADOS QUE ALIMENTAM O BLOCO E
+
+   Os campos mantêm os nomes da versão anterior. Onde antes havia uma taxa e
+   um tíquete únicos, passa a existir o valor efetivo, que é a média dos
+   briefings ponderada pelas entregas. Assim o bloco E do resumo não muda de
+   forma, apenas de conteúdo.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_10_conversao_atual AS
+WITH soma AS (
+  SELECT
+    grupo,
+    sum(n_entregues)                                        AS entregas,
+    sum(n_entregues * taxa_conversao)                       AS conversoes_hoje,
+    sum(n_entregues * taxa_conversao * ticket_medio)        AS receita_hoje,
+    sum(n_com_gr / 100.0 * taxa_conversao * ticket_medio)   AS valor_por_ponto_percentual,
+    count(*)                                                AS briefings
+  FROM vt_briefing_economia
+  GROUP BY grupo
+)
+SELECT
+  s.grupo,
+  s.briefings,
+  s.entregas,
+  s.conversoes_hoje / nullif(s.entregas, 0)               AS taxa_conversao,
+  s.receita_hoje / nullif(s.conversoes_hoje, 0)           AS valor_conversao,
+  s.receita_hoje / nullif(s.entregas, 0)                  AS valor_por_entrega,
+  s.conversoes_hoje,
+  s.receita_hoje,
+  s.receita_hoje / nullif(c.custo_total, 0)               AS retorno_por_real,
+  s.valor_por_ponto_percentual
+FROM soma s
+JOIN vt_res_09_custo_atual c ON s.grupo = c.grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_10_conversao_cenario AS
+WITH soma AS (
+  SELECT
+    grupo,
+    ordem,
+    cenario,
+    sum(entregas_liquidas)                                     AS entregas_liquidas,
+    sum(conversoes_incrementais)                               AS conversoes_incrementais,
+    sum(receita_incremental)                                   AS receita_incremental,
+    sum(CASE WHEN receita_incremental < 0 THEN 1 ELSE 0 END)   AS briefings_com_perda,
+    sum(CASE WHEN receita_incremental > 0 THEN receita_incremental ELSE 0 END) AS receita_ganha
+  FROM vt_res_10_briefing_valuation
+  GROUP BY grupo, ordem, cenario
+)
+SELECT
+  s.grupo,
+  s.ordem,
+  s.cenario,
+  s.entregas_liquidas,
+  s.entregas_liquidas / nullif(v.disparos_com_gr, 0)        AS pp_incremental,
+  s.receita_incremental / nullif(s.entregas_liquidas, 0)    AS valor_por_entrega,
+  s.conversoes_incrementais,
+  s.receita_incremental,
+  s.receita_incremental / nullif(a.receita_hoje, 0)         AS crescimento_sobre_receita_atual,
+  s.briefings_com_perda,
+  s.receita_ganha
+FROM soma s
+JOIN (SELECT grupo, sum(n_com_gr) AS disparos_com_gr FROM vt_briefing_economia GROUP BY grupo) v
+  ON s.grupo = v.grupo
+JOIN vt_res_10_conversao_atual a ON s.grupo = a.grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_10_sensibilidade AS
+SELECT
+  c.grupo,
+  c.ordem,
+  c.cenario,
+  s.rotulo_taxa,
+  s.rotulo_valor,
+  a.taxa_conversao  * s.mult_taxa                       AS taxa_aplicada,
+  a.valor_conversao * s.mult_valor                      AS ticket_aplicado,
+  c.entregas_liquidas,
+  c.receita_incremental * s.mult_taxa * s.mult_valor    AS receita_incremental
+FROM vt_res_10_conversao_cenario c
+JOIN vt_res_10_conversao_atual a ON c.grupo = a.grupo
+CROSS JOIN vt_param_sensibilidade s
+;
+
+
+/* =============================================================================
+   SEÇÃO 11  APROFUNDAMENTOS
+   =============================================================================
+   Camada que responde às perguntas que o resumo anterior deixava em aberto:
+   se o efeito é uniforme ou concentrado, se ele sobrevive à comparação com uma
+   regra simples, quanto do resultado depende de extrapolação, qual o esforço de
+   implementação e em que condição o dado foi coletado.
+
+   Todas as views guardam valores brutos. O arredondamento acontece apenas no
+   resumo.
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   11.1  QUALIDADE DOS REGISTROS RECEBIDOS
+
+   Volume descartado antes do estudo, por motivo. Descarte alto por status
+   contraditório ou ausente indica problema de carga na origem e reduz a
+   cobertura do estudo, sem invalidar a comparação.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_qualidade AS
+WITH total AS (
+  SELECT
+    count(*)                                                      AS registros,
+    sum(CASE WHEN qualidade = 'OK' THEN 1 ELSE 0 END)             AS aproveitados,
+    sum(CASE WHEN qualidade <> 'OK' THEN 1 ELSE 0 END)            AS descartados,
+    sum(CASE WHEN qualidade = 'STATUS_INCONSISTENTE' THEN 1 ELSE 0 END) AS status_contraditorio,
+    sum(CASE WHEN qualidade = 'SEM_STATUS' THEN 1 ELSE 0 END)     AS sem_status,
+    sum(CASE WHEN qualidade IN ('SEM_CPF','SEM_TELEFONE') THEN 1 ELSE 0 END) AS chave_invalida
+  FROM vt_crm_envios_qualidade
+)
+SELECT
+  gp.grupo,
+  t.registros,
+  t.aproveitados,
+  t.descartados,
+  t.descartados / nullif(t.registros, 0) AS fracao_descartada,
+  t.status_contraditorio,
+  t.sem_status,
+  t.chave_invalida
+FROM total t
+CROSS JOIN (SELECT DISTINCT grupo FROM vt_grupo_param) gp
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.2  RETENTATIVAS
+
+   Disparos que representam repetição para o mesmo cliente, campanha e telefone.
+   Retentativa é custo de mídia sem novo alcance, e por isso entra como
+   oportunidade própria de economia.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_retentativa AS
+SELECT
+  grupo,
+  count(*)                                                        AS envios,
+  sum(CASE WHEN registros_originais > 1 THEN 1 ELSE 0 END)        AS envios_com_retentativa,
+  avg(CASE WHEN registros_originais > 1 THEN 1 ELSE 0 END)        AS fracao_com_retentativa,
+  sum(registros_originais) - count(*)                             AS disparos_repetidos,
+  (sum(registros_originais) - count(*)) / nullif(sum(registros_originais), 0) AS fracao_disparos_repetidos
+FROM vt_base_grupo
+GROUP BY grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.3  SAFRA DO CADASTRO
+
+   Entrega do telefone recomendado conforme a idade da carga que o registrou,
+   medida em meses até a ingestão mais recente da base.
+
+   Ressalva declarada: sem data de envio na base de campanhas, a idade é medida
+   em relação à carga mais recente, e não ao momento do disparo. A leitura
+   correta é sobre a safra do registro, e não sobre decaimento no tempo entre
+   cadastro e acionamento.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_safra AS
+WITH referencia AS (
+  SELECT max(try_cast(data_ingestao_gr AS TIMESTAMP)) AS mais_recente
+  FROM vt_experimento
+),
+classificado AS (
+  SELECT
+    e.grupo,
+    e.entregue,
+    CASE
+      WHEN try_cast(e.data_ingestao_gr AS TIMESTAMP) IS NULL THEN 'INDETERMINADA'
+      WHEN months_between(r.mais_recente, try_cast(e.data_ingestao_gr AS TIMESTAMP)) <= 3  THEN '1. ate 3 meses'
+      WHEN months_between(r.mais_recente, try_cast(e.data_ingestao_gr AS TIMESTAMP)) <= 6  THEN '2. 3 a 6 meses'
+      WHEN months_between(r.mais_recente, try_cast(e.data_ingestao_gr AS TIMESTAMP)) <= 12 THEN '3. 6 a 12 meses'
+      ELSE '4. acima de 12 meses'
+    END AS safra
+  FROM vt_experimento e
+  CROSS JOIN referencia r
+  WHERE e.concordante = 1
+)
+SELECT
+  grupo,
+  safra,
+  count(*)      AS envios,
+  sum(entregue) AS entregas,
+  avg(entregue) AS taxa
+FROM classificado
+GROUP BY grupo, safra
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_safra_contraste AS
+SELECT
+  nova.grupo,
+  nova.taxa   AS taxa_recente,
+  nova.envios AS envios_recente,
+  velha.taxa  AS taxa_antiga,
+  velha.envios AS envios_antiga,
+  nova.taxa - velha.taxa AS diferenca
+FROM (SELECT * FROM vt_res_11_safra WHERE safra = '1. ate 3 meses') nova
+FULL OUTER JOIN (SELECT * FROM vt_res_11_safra WHERE safra = '4. acima de 12 meses') velha
+  ON nova.grupo = velha.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.4  COMPARAÇÃO COM UMA REGRA SIMPLES
+
+   Responde à objeção mais dura que o estudo pode receber: quanto do ganho vem
+   do Golden Record e quanto viria de qualquer heurística razoável?
+
+   A regra simples usada é o telefone que o próprio CRM mais aciona para aquele
+   cliente, que é o candidato natural a substituto sem nenhum investimento em
+   cadastro. Os disparos são separados em três grupos mutuamente exclusivos:
+   o número recomendado, o número mais acionado quando ele difere do recomendado,
+   e os demais.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_benchmark AS
+WITH classificado AS (
+  SELECT
+    grupo,
+    entregue,
+    CASE
+      WHEN concordante = 1                              THEN 'RECOMENDADO'
+      WHEN heuristica_mais_acionado = 1                 THEN 'REGRA_SIMPLES'
+      ELSE                                                   'DEMAIS'
+    END AS estrategia
+  FROM vt_experimento
+),
+agg AS (
+  SELECT grupo, estrategia, count(*) AS envios, sum(entregue) AS entregas,
+         sum(entregue) / nullif(count(*), 0) AS taxa
+  FROM classificado
+  GROUP BY grupo, estrategia
+)
+SELECT
+  r.grupo,
+  r.taxa                                    AS taxa_recomendado,
+  r.envios                                  AS envios_recomendado,
+  h.taxa                                    AS taxa_regra_simples,
+  h.envios                                  AS envios_regra_simples,
+  d.taxa                                    AS taxa_demais,
+  r.taxa - h.taxa                           AS ganho_sobre_regra_simples,
+  h.taxa - d.taxa                           AS ganho_da_regra_simples,
+  (r.taxa - h.taxa) / nullif(r.taxa - d.taxa, 0) AS parcela_atribuivel_ao_cadastro
+FROM (SELECT * FROM agg WHERE estrategia = 'RECOMENDADO') r
+LEFT JOIN (SELECT * FROM agg WHERE estrategia = 'REGRA_SIMPLES') h ON r.grupo = h.grupo
+LEFT JOIN (SELECT * FROM agg WHERE estrategia = 'DEMAIS') d ON r.grupo = d.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.5  DISTRIBUIÇÃO DO EFEITO ENTRE CAMPANHAS
+
+   O resumo apresenta uma média ponderada. Esta view mostra a dispersão, que
+   protege contra a leitura de que todas as campanhas se comportam como a média.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_distribuicao AS
+SELECT
+  grupo,
+  count(*)                                              AS id_briefings,
+  percentile_approx(p1 - p0, 0.25)                      AS quartil_inferior,
+  percentile_approx(p1 - p0, 0.50)                      AS mediana,
+  percentile_approx(p1 - p0, 0.75)                      AS quartil_superior,
+  min(p1 - p0)                                          AS minimo,
+  max(p1 - p0)                                          AS maximo
+FROM vt_res_08_por_campanha
+GROUP BY grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.6  EFEITO POR PORTE DE CAMPANHA E POR INTENSIDADE DE CONTATO
+
+   Duas segmentações que respondem para quem o efeito é maior, e portanto por
+   onde a adoção rende mais.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_por_faixa AS
+WITH agg AS (
+  SELECT
+    e.grupo,
+    v.faixa_volume,
+    sum(CASE WHEN e.concordante = 1 THEN 1 ELSE 0 END)          AS n1,
+    sum(CASE WHEN e.concordante = 1 THEN e.entregue ELSE 0 END) AS k1,
+    sum(CASE WHEN e.concordante = 0 THEN 1 ELSE 0 END)          AS n0,
+    sum(CASE WHEN e.concordante = 0 THEN e.entregue ELSE 0 END) AS k0
+  FROM vt_experimento e
+  JOIN vt_campanha_volume v ON e.grupo = v.grupo AND e.campanha = v.campanha
+  GROUP BY e.grupo, v.faixa_volume
+)
+SELECT
+  grupo, faixa_volume, n1, n0,
+  k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca
+FROM agg
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_por_intensidade AS
+WITH freq AS (
+  SELECT grupo, cpf, count(*) AS envios_cpf FROM vt_experimento GROUP BY grupo, cpf
+),
+agg AS (
+  SELECT
+    e.grupo,
+    CASE WHEN f.envios_cpf = 1   THEN '1. um envio'
+         WHEN f.envios_cpf <= 3  THEN '2. dois a tres'
+         WHEN f.envios_cpf <= 10 THEN '3. quatro a dez'
+         ELSE                         '4. acima de dez' END      AS faixa,
+    sum(CASE WHEN e.concordante = 1 THEN 1 ELSE 0 END)           AS n1,
+    sum(CASE WHEN e.concordante = 1 THEN e.entregue ELSE 0 END)  AS k1,
+    sum(CASE WHEN e.concordante = 0 THEN 1 ELSE 0 END)           AS n0,
+    sum(CASE WHEN e.concordante = 0 THEN e.entregue ELSE 0 END)  AS k0
+  FROM vt_experimento e
+  JOIN freq f ON e.grupo = f.grupo AND e.cpf = f.cpf
+  GROUP BY e.grupo,
+    CASE WHEN f.envios_cpf = 1   THEN '1. um envio'
+         WHEN f.envios_cpf <= 3  THEN '2. dois a tres'
+         WHEN f.envios_cpf <= 10 THEN '3. quatro a dez'
+         ELSE                         '4. acima de dez' END
+)
+SELECT grupo, faixa, n1, n0,
+       k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca
+FROM agg
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.7  DISPERSÃO REGIONAL
+
+   Efeito calculado dentro de cada código de área, para verificar se o ganho é
+   nacional ou concentrado em algumas praças.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_por_ddd AS
+WITH agg AS (
+  SELECT
+    grupo,
+    ddd_crm,
+    sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END)         AS n1,
+    sum(CASE WHEN concordante = 1 THEN entregue ELSE 0 END)  AS k1,
+    sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END)         AS n0,
+    sum(CASE WHEN concordante = 0 THEN entregue ELSE 0 END)  AS k0
+  FROM vt_experimento
+  GROUP BY grupo, ddd_crm
+),
+calc AS (
+  SELECT *, k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca
+  FROM agg
+  WHERE n1 >= 1000 AND n0 >= 1000
+)
+SELECT
+  grupo,
+  count(*)                                                  AS ddds_avaliados,
+  avg(CASE WHEN diferenca > 0 THEN 1 ELSE 0 END)            AS fracao_com_ganho,
+  percentile_approx(diferenca, 0.50)                        AS mediana,
+  min(diferenca)                                            AS minimo,
+  max(diferenca)                                            AS maximo
+FROM calc
+GROUP BY grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.8  CONTRAFACTUAL POR CAMPANHA E CONCENTRAÇÃO DO GANHO
+
+   Abre o cenário central em uma linha por campanha e mede quanto do ganho está
+   concentrado nas maiores. Se poucas campanhas concentram a maior parte, a
+   adoção deve começar dirigida em vez de geral.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_campanha_valor AS
+WITH d AS (
+  SELECT
+    grupo,
+    campanha,
+    sum(CASE WHEN entregue = 0 THEN taxa_calibracao_campanha ELSE 0 END)       AS recuperadas,
+    sum(CASE WHEN entregue = 1 THEN 1 - taxa_calibracao_campanha ELSE 0 END)   AS perdidas
+  FROM vt_envios_gr_diferente
+  GROUP BY grupo, campanha
+)
+SELECT
+  d.grupo,
+  d.campanha,
+  v.n_envios,
+  d.recuperadas,
+  d.perdidas,
+  d.recuperadas - d.perdidas AS entregas_liquidas
+FROM d
+JOIN vt_campanha_volume v ON d.grupo = v.grupo AND d.campanha = v.campanha
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_concentracao AS
+WITH ordenado AS (
+  SELECT
+    grupo,
+    campanha,
+    entregas_liquidas,
+    row_number() OVER (PARTITION BY grupo ORDER BY entregas_liquidas DESC) AS posicao,
+    sum(entregas_liquidas) OVER (PARTITION BY grupo)                       AS total_liquidas,
+    sum(entregas_liquidas) OVER (
+      PARTITION BY grupo ORDER BY entregas_liquidas DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)                    AS acumulado
+  FROM vt_res_11_campanha_valor
+  WHERE entregas_liquidas > 0
+)
+SELECT
+  grupo,
+  count(*)                                                                   AS campanhas_com_ganho,
+  max(total_liquidas)                                                        AS total_liquidas,
+  min(CASE WHEN acumulado >= 0.5 * total_liquidas THEN posicao END)          AS campanhas_para_metade,
+  max(CASE WHEN posicao <= 10 THEN acumulado END)                            AS ganho_das_dez_maiores,
+  max(CASE WHEN posicao <= 10 THEN acumulado END) / nullif(max(total_liquidas), 0) AS fracao_dez_maiores
+FROM ordenado
+GROUP BY grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.9  FAIXA ESTATÍSTICA DO VALOR
+
+   A faixa de cenários da seção 07 representa incerteza de premissa. Esta view
+   representa a outra incerteza, a amostral: dado o volume observado, qual a
+   margem de erro da própria diferença medida, propagada para reais.
+
+   Recalcula o cenário calibrado global dos briefings promocionais trocando a
+   taxa do telefone recomendado pelos limites do seu intervalo de Wilson de 95
+   por cento. Cada briefing recebe candidatos vezes a taxa menos entregas em
+   risco vezes um menos a taxa, convertido pela própria economia. A faixa fica,
+   por construção, dentro do teto e ao redor do cenário calibrado global.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_faixa_estatistica AS
+SELECT
+  b.grupo,
+  max(s.p1)                                                                 AS taxa_central,
+  max(s.ic_inf_conc)                                                        AS taxa_inf,
+  max(s.ic_sup_conc)                                                        AS taxa_sup,
+  max(s.diferenca)                                                          AS diferenca,
+  max(s.diferenca - 1.959964 * s.se_diff)                                   AS dif_inf,
+  max(s.diferenca + 1.959964 * s.se_diff)                                   AS dif_sup,
+  sum((b.candidatos * s.ic_inf_conc - b.em_risco * (1 - s.ic_inf_conc))
+      * e.taxa_conversao * e.ticket_medio)                                  AS receita_inf,
+  sum((b.candidatos * s.p1 - b.em_risco * (1 - s.p1))
+      * e.taxa_conversao * e.ticket_medio)                                  AS receita_central,
+  sum((b.candidatos * s.ic_sup_conc - b.em_risco * (1 - s.ic_sup_conc))
+      * e.taxa_conversao * e.ticket_medio)                                  AS receita_sup
+FROM vt_briefing_base b
+JOIN vt_briefing_economia e ON b.grupo = e.grupo AND b.id_briefing = e.id_briefing
+JOIN vt_res_05_bruto s      ON b.grupo = s.grupo
+GROUP BY b.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.10  ESFORÇO DE IMPLEMENTAÇÃO E ATIVO DE CADASTRO MONETIZADO
+
+   O valuation até aqui mede apenas o benefício. Esta view dimensiona o outro
+   lado: quantos cadastros precisariam ser atualizados, e quanto vale o contato
+   recuperado dos clientes hoje inalcançáveis.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_esforco AS
+SELECT
+  e.grupo,
+  count(DISTINCT CASE WHEN e.classe_concordancia = 'DIFERENTE' THEN e.cpf END) AS cpfs_a_atualizar,
+  count(DISTINCT e.cpf)                                                        AS cpfs_com_cobertura,
+  count(DISTINCT CASE WHEN e.classe_concordancia = 'DIFERENTE' THEN e.cpf END)
+    / nullif(count(DISTINCT e.cpf), 0)                                         AS fracao_a_atualizar
+FROM vt_experimento e
+GROUP BY e.grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_ativo_cadastro AS
+SELECT
+  f.grupo,
+  f.com_telefone_novo,
+  f.gr_comprovado,
+  g.taxa_concordante_global                                                   AS taxa_esperada,
+  f.com_telefone_novo * g.taxa_concordante_global                             AS contatos_recuperaveis,
+  f.com_telefone_novo * g.taxa_concordante_global * a.valor_por_entrega       AS valor_contato_recuperavel,
+  f.gr_comprovado * a.valor_por_entrega                                       AS valor_contato_comprovado
+FROM vt_res_07_cpfs f
+JOIN vt_taxa_global_grupo g      ON f.grupo = g.grupo
+JOIN vt_res_10_conversao_atual a ON f.grupo = a.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.11  JANELA DO ESTUDO E VALIDADE TEMPORAL DA RECOMENDAÇÃO
+
+   Com a data do registro de disparo disponível na origem, duas perguntas que
+   antes ficavam em aberto passam a ter resposta.
+
+   A primeira é qual período o estudo cobre. Sem isso, nenhum valor do bloco de
+   valuation poderia ser anualizado. Com a janela e os meses com registro
+   conhecidos, a linha 79 do resumo faz essa conta.
+
+   A segunda é mais delicada e diz respeito à validade do contrafactual. Afirmar
+   que o Golden Record teria recomendado outro telefone só faz sentido se aquela
+   recomendação já existisse quando a campanha ocorreu. Comparando a data de
+   ingestão do registro do Golden Record com a data do disparo, é possível
+   separar os envios em que a recomendação era anterior daqueles em que ela é
+   posterior e portanto anacrônica.
+
+   O efeito recalculado apenas sobre os envios temporalmente válidos é o teste
+   de sensibilidade correspondente. Se ele se mantiver próximo do efeito geral,
+   a ressalva temporal deixa de ser uma ameaça relevante.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_janela AS
+SELECT
+  grupo,
+  min(data_disparo)                                     AS primeiro_registro,
+  max(data_disparo)                                     AS ultimo_registro,
+  datediff(max(data_disparo), min(data_disparo)) + 1    AS dias_cobertos,
+  count(DISTINCT date_format(data_disparo, 'yyyy-MM'))  AS meses_com_registro,
+  count(*)                                              AS disparos
+FROM vt_base_grupo
+GROUP BY grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_validade_temporal AS
+WITH marcado AS (
+  SELECT
+    grupo,
+    CASE
+      WHEN try_cast(data_ingestao_gr AS DATE) IS NULL OR data_disparo IS NULL
+        THEN 'INDETERMINADA'
+      WHEN try_cast(data_ingestao_gr AS DATE) <= data_disparo
+        THEN 'RECOMENDACAO_ANTERIOR'
+      ELSE 'RECOMENDACAO_POSTERIOR'
+    END AS validade
+  FROM vt_experimento
+)
+SELECT
+  grupo,
+  count(*)                                                             AS envios,
+  sum(CASE WHEN validade = 'RECOMENDACAO_ANTERIOR' THEN 1 ELSE 0 END)  AS anteriores,
+  avg(CASE WHEN validade = 'RECOMENDACAO_ANTERIOR' THEN 1 ELSE 0 END)  AS fracao_anteriores,
+  sum(CASE WHEN validade = 'RECOMENDACAO_POSTERIOR' THEN 1 ELSE 0 END) AS posteriores,
+  sum(CASE WHEN validade = 'INDETERMINADA' THEN 1 ELSE 0 END)          AS indeterminadas
+FROM marcado
+GROUP BY grupo
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_efeito_temporalmente_valido AS
+WITH agg AS (
+  SELECT
+    grupo,
+    sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END)        AS n1,
+    sum(CASE WHEN concordante = 1 THEN entregue ELSE 0 END) AS k1,
+    sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END)        AS n0,
+    sum(CASE WHEN concordante = 0 THEN entregue ELSE 0 END) AS k0
+  FROM vt_experimento
+  WHERE try_cast(data_ingestao_gr AS DATE) <= data_disparo
+  GROUP BY grupo
+)
+SELECT
+  grupo, n1, n0,
+  k1 / nullif(n1, 0) - k0 / nullif(n0, 0) AS diferenca
+FROM agg
+;
+
+
+/* -----------------------------------------------------------------------------
+   11.12  EVOLUÇÃO MENSAL
+
+   Responde a duas perguntas que a leitura agregada não separa.
+
+   A primeira é sobre o cadastro: a vantagem do telefone recomendado cresce,
+   encolhe ou fica estável ao longo dos meses? Vantagem que encolhe indica
+   cadastro envelhecendo entre as cargas. Vantagem que cresce indica que as
+   cargas recentes estão acrescentando informação útil.
+
+   A segunda é sobre a operação, e é independente do cadastro: a entrega está
+   melhorando por conta própria? O indicador correto para isso é a taxa do braço
+   divergente, ou seja, o que acontece quando o telefone recomendado não é
+   usado. Se essa taxa sobe mês a mês, a operação está melhorando sozinha, e o
+   ganho atribuível ao Golden Record precisa ser lido contra esse pano de fundo.
+
+   Separar as duas evita a confusão mais comum na leitura de série temporal, que
+   é atribuir ao cadastro uma melhora que vem de outra causa, como higienização
+   de base, mudança de fornecedor ou sazonalidade de campanha.
+
+   A tendência é medida pela inclinação de uma reta ajustada aos valores
+   mensais, expressa em pontos percentuais por mês. O cálculo é feito pela
+   fórmula fechada de mínimos quadrados, sem depender de função de regressão.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_11_mensal AS
+SELECT
+  grupo,
+  date_format(data_disparo, 'yyyy-MM')                     AS mes,
+  count(*)                                                 AS disparos,
+  sum(entregue)                                            AS entregas,
+  avg(entregue)                                            AS taxa_geral,
+  avg(CASE WHEN tem_gr THEN 1 ELSE 0 END)                  AS cobertura,
+  sum(CASE WHEN concordante = 1 THEN 1 ELSE 0 END)         AS n1,
+  sum(CASE WHEN concordante = 1 THEN entregue ELSE 0 END)  AS k1,
+  sum(CASE WHEN concordante = 0 THEN 1 ELSE 0 END)         AS n0,
+  sum(CASE WHEN concordante = 0 THEN entregue ELSE 0 END)  AS k0
+FROM vt_base_grupo
+WHERE data_disparo IS NOT NULL
+GROUP BY grupo, date_format(data_disparo, 'yyyy-MM')
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_mensal_calc AS
+SELECT
+  *,
+  k1 / nullif(n1, 0)                                       AS taxa_com_recomendado,
+  k0 / nullif(n0, 0)                                       AS taxa_sem_recomendado,
+  k1 / nullif(n1, 0) - k0 / nullif(n0, 0)                  AS vantagem,
+  row_number() OVER (PARTITION BY grupo ORDER BY mes)      AS indice_mes
+FROM vt_res_11_mensal
+;
+
+/* Inclinação da reta ajustada, em variação por mês, para quatro séries:
+   a vantagem do cadastro, a entrega sem o telefone recomendado, a entrega com
+   o telefone recomendado e a cobertura da base. */
+CREATE OR REPLACE TEMP VIEW vt_res_11_tendencia AS
+WITH s AS (
+  SELECT
+    grupo,
+    count(*)                                       AS meses,
+    sum(indice_mes)                                AS sx,
+    sum(indice_mes * indice_mes)                   AS sxx,
+    sum(vantagem)                                  AS sy_vant,
+    sum(indice_mes * vantagem)                     AS sxy_vant,
+    sum(taxa_sem_recomendado)                      AS sy_sem,
+    sum(indice_mes * taxa_sem_recomendado)         AS sxy_sem,
+    sum(taxa_com_recomendado)                      AS sy_com,
+    sum(indice_mes * taxa_com_recomendado)         AS sxy_com,
+    sum(cobertura)                                 AS sy_cob,
+    sum(indice_mes * cobertura)                    AS sxy_cob,
+    sum(CASE WHEN vantagem > 0 THEN 1 ELSE 0 END)  AS meses_com_ganho
+  FROM vt_res_11_mensal_calc
+  WHERE vantagem IS NOT NULL
+  GROUP BY grupo
+)
+SELECT
+  grupo,
+  meses,
+  meses_com_ganho,
+  (meses * sxy_vant - sx * sy_vant) / nullif(meses * sxx - sx * sx, 0) AS inclinacao_vantagem,
+  (meses * sxy_sem  - sx * sy_sem)  / nullif(meses * sxx - sx * sx, 0) AS inclinacao_sem_recomendado,
+  (meses * sxy_com  - sx * sy_com)  / nullif(meses * sxx - sx * sx, 0) AS inclinacao_com_recomendado,
+  (meses * sxy_cob  - sx * sy_cob)  / nullif(meses * sxx - sx * sx, 0) AS inclinacao_cobertura
+FROM s
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_11_primeiro_ultimo AS
+WITH marcado AS (
+  SELECT
+    *,
+    row_number() OVER (PARTITION BY grupo ORDER BY mes ASC)  AS rn_ini,
+    row_number() OVER (PARTITION BY grupo ORDER BY mes DESC) AS rn_fim
+  FROM vt_res_11_mensal_calc
+)
+SELECT
+  i.grupo,
+  i.mes                                            AS primeiro_mes,
+  f.mes                                            AS ultimo_mes,
+  i.disparos                                       AS disparos_inicio,
+  f.disparos                                       AS disparos_fim,
+  i.taxa_geral                                     AS taxa_geral_inicio,
+  f.taxa_geral                                     AS taxa_geral_fim,
+  f.taxa_geral - i.taxa_geral                      AS variacao_taxa_geral,
+  i.taxa_sem_recomendado                           AS sem_recomendado_inicio,
+  f.taxa_sem_recomendado                           AS sem_recomendado_fim,
+  f.taxa_sem_recomendado - i.taxa_sem_recomendado  AS variacao_sem_recomendado,
+  i.taxa_com_recomendado                           AS com_recomendado_inicio,
+  f.taxa_com_recomendado                           AS com_recomendado_fim,
+  f.taxa_com_recomendado - i.taxa_com_recomendado  AS variacao_com_recomendado,
+  i.vantagem                                       AS vantagem_inicio,
+  f.vantagem                                       AS vantagem_fim,
+  f.vantagem - i.vantagem                          AS variacao_vantagem,
+  i.cobertura                                      AS cobertura_inicio,
+  f.cobertura                                      AS cobertura_fim,
+  f.cobertura - i.cobertura                        AS variacao_cobertura
+FROM (SELECT * FROM marcado WHERE rn_ini = 1) i
+JOIN (SELECT * FROM marcado WHERE rn_fim = 1) f ON i.grupo = f.grupo
+;
+
+
+/* =============================================================================
+   SEÇÃO 12  RESUMO EXECUTIVO
+   =============================================================================
+   Única saída exibida por este arquivo. Cada linha traz o indicador, o valor, a
+   definição, como o número foi calculado, como lê-lo e um exemplo concreto.
+
+   Blocos, na ordem em que a história deve ser contada:
+     A  Base e oportunidade, o tamanho do campo de jogo
+     B  Evidência causal, o telefone certo entrega mais
+     C  Robustez, o efeito se repete
+     D  Valuation pelo custo de disparo, o piso sem premissa comercial
+     E  Valuation pela conversão, o valor de negócio
+     F  Clientes, o ativo de cadastro
+
+   Os exemplos usam o volume de referência definido em 00.2.
+   ============================================================================= */
+
+CREATE OR REPLACE TEMP VIEW vt_res_12_resumo AS
+
+/* ---------------------------------------------------------------- BLOCO A -- */
+SELECT
+  v.grupo,
+  'A. Base e oportunidade'                            AS bloco,
+  1                                                   AS ordem,
+  'Disparos analisados'                               AS indicador,
+  CAST(v.disparos AS DOUBLE)                          AS valor,
+  'envios'                                            AS unidade,
+  'Volume de SMS que passou pelos filtros de qualidade e entrou no estudo.'  AS definicao,
+  'Contagem de combinacoes distintas de cliente, campanha e telefone, apos descartar registros com status contraditorio ou chave invalida.' AS calculo,
+  'E o denominador de todas as taxas apresentadas adiante. Quanto maior, mais estavel a estimativa.' AS interpretacao,
+  concat('Equivale a ', format_number(v.disparos / 1000000.0, 1), ' campanhas de um milhao de disparos.') AS exemplo,
+  'vt_res_04_volume'                                  AS origem
+FROM vt_res_04_volume v
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 2, 'Clientes distintos acionados',
+  CAST(v.clientes AS DOUBLE), 'CPFs',
+  'Quantidade de pessoas diferentes que receberam ao menos um SMS no periodo.',
+  'Contagem distinta de CPF na base de disparos valida.',
+  'Mostra que o volume de envios nao vem de poucos clientes muito acionados. Compare com a linha 1 para obter a media de disparos por cliente.',
+  concat('Media de ', format_number(v.disparos / nullif(v.clientes, 0), 2), ' disparos por cliente no periodo.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 3, 'Campanhas analisadas',
+  CAST(v.id_briefings AS DOUBLE), 'campanhas',
+  'Quantidade de campanhas distintas dentro do escopo.',
+  'Contagem distinta do identificador de campanha.',
+  'Sustenta a analise estratificada. Muitas campanhas permitem comparar o efeito dentro de cada uma e verificar se ele se repete.',
+  concat('Media de ', format_number(v.disparos / nullif(v.id_briefings, 0), 0), ' disparos por campanha.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 4, 'Taxa de entrega geral hoje',
+  round(CAST(100.0 * v.taxa_entrega AS DOUBLE), 4), '%',
+  'Percentual dos disparos que chegaram ao destino, considerando todos os telefones usados.',
+  'Entregas divididas por disparos, sobre a base inteira do escopo.',
+  'E a linha de base do estudo. Todo ganho estimado adiante deve ser lido como avanco a partir deste patamar.',
+  concat('Hoje, ', format_number(100.0 * (1 - v.taxa_entrega), 1), ' por cento dos disparos nao chegam ao destino.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 5, 'Cobertura do Golden Record sobre disparos',
+  round(CAST(100.0 * v.cobertura_disparo AS DOUBLE), 4), '%',
+  'Percentual dos disparos cujo cliente possui telefone cadastrado no Golden Record.',
+  'Disparos com CPF presente no Golden Record divididos pelo total de disparos.',
+  'Define o teto de alcance de qualquer iniciativa baseada no Golden Record. O restante dos disparos esta fora do alcance da base atual.',
+  concat('Em uma campanha de ', format_number(gp.volume_referencia, 0), ' disparos, cerca de ',
+         format_number(v.cobertura_disparo * gp.volume_referencia, 0), ' teriam telefone comparavel.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v JOIN vt_grupo_param gp ON v.grupo = gp.grupo
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 6, 'Cobertura do Golden Record sobre clientes',
+  round(CAST(100.0 * v.cobertura_cliente AS DOUBLE), 4), '%',
+  'Percentual dos clientes acionados que possuem telefone no Golden Record.',
+  'CPFs distintos presentes no Golden Record divididos pelo total de CPFs distintos acionados.',
+  'Compare com a linha 5. Quando a cobertura por disparo e maior que a cobertura por cliente, os clientes cobertos sao justamente os mais acionados, o que amplia o efeito pratico.',
+  concat('De cada cem clientes acionados, ', format_number(100.0 * v.cobertura_cliente, 0), ' tem telefone no Golden Record.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v
+UNION ALL
+SELECT c.grupo, 'A. Base e oportunidade', 7, 'Disparos em que o Golden Record indicaria outro numero',
+  round(CAST(100.0 * c.fracao_envios AS DOUBLE), 4), '%',
+  'Percentual dos disparos com cobertura em que o numero usado difere do telefone de ranking 1.',
+  'Envios classificados como divergentes divididos pelo total de envios com cobertura do Golden Record.',
+  'E o espaco em que adotar o Golden Record muda alguma coisa. Nos demais disparos a base apenas confirma o numero que ja seria usado, sem efeito pratico.',
+  concat('Em ', format_number(100.0 - 100.0 * c.fracao_envios, 1),
+         ' por cento dos disparos o CRM ja acerta o telefone recomendado, sem usar a base.'),
+  'vt_res_04_concordancia'
+FROM vt_res_04_concordancia c WHERE c.classe_concordancia = 'DIFERENTE'
+UNION ALL
+SELECT a.grupo, 'A. Base e oportunidade', 8, 'Insucessos em que o Golden Record indicaria outro numero',
+  round(CAST(100.0 * a.fracao_sobre_com_gr AS DOUBLE), 4), '%',
+  'Dos SMS que nao chegaram e tem cobertura, fracao que teria ido para um numero diferente.',
+  'Insucessos divergentes divididos pelo total de insucessos com cobertura do Golden Record.',
+  'E o tamanho bruto da oportunidade de recuperacao, antes de qualquer ajuste. Ainda nao e uma estimativa de ganho, porque nem todo numero diferente entregaria.',
+  concat('Sao ', format_number(a.gr_diferente, 0), ' disparos que falharam e teriam ido para outro telefone.'),
+  'vt_res_04_anatomia_insucesso'
+FROM vt_res_04_anatomia_insucesso a
+UNION ALL
+SELECT v.grupo, 'A. Base e oportunidade', 9, 'Disparos que nao chegam ao destino',
+  CAST(v.insucessos AS DOUBLE), 'envios',
+  'Volume absoluto de SMS que nao foram entregues no escopo analisado.',
+  'Disparos menos entregas.',
+  'Fecha o funil de oportunidade. Deste volume, a parcela com cobertura e telefone divergente e o que o Golden Record pode atacar.',
+  concat('Ao custo unitario informado, representam ', format_number(v.insucessos * gp.custo_sms, 2), ' reais.'),
+  'vt_res_04_volume'
+FROM vt_res_04_volume v JOIN vt_grupo_param gp ON v.grupo = gp.grupo
+
+/* ---------------------------------------------------------------- BLOCO B -- */
+UNION ALL
+SELECT b.grupo, 'B. Evidencia causal', 10, 'Entrega com telefone igual ao Golden Record',
+  round(CAST(100.0 * b.p1 AS DOUBLE), 4), '%',
+  'Taxa de entrega dos disparos em que o numero usado coincidiu com o telefone de ranking 1.',
+  'Entregas divididas por envios dentro do braco concordante.',
+  'E o braco tratado do experimento natural. A coincidencia ocorre por sobreposicao de cadastros, e nao por decisao de quem conhecia o resultado.',
+  concat('Intervalo de 95 por cento entre ', format_number(100.0 * b.ic_inf_conc, 2),
+         ' e ', format_number(100.0 * b.ic_sup_conc, 2), ' por cento, sobre ',
+         format_number(b.n1, 0), ' disparos.'),
+  'vt_res_05_bruto'
+FROM vt_res_05_bruto b
+UNION ALL
+SELECT b.grupo, 'B. Evidencia causal', 11, 'Entrega com telefone diferente do Golden Record',
+  round(CAST(100.0 * b.p0 AS DOUBLE), 4), '%',
+  'Taxa de entrega dos disparos que usaram um numero diferente do telefone de ranking 1.',
+  'Entregas divididas por envios dentro do braco divergente.',
+  'E o braco de comparacao. A distancia para a linha 10 e a materia-prima de todo o valuation.',
+  concat('Intervalo de 95 por cento entre ', format_number(100.0 * b.ic_inf_disc, 2),
+         ' e ', format_number(100.0 * b.ic_sup_disc, 2), ' por cento, sobre ',
+         format_number(b.n0, 0), ' disparos.'),
+  'vt_res_05_bruto'
+FROM vt_res_05_bruto b
+UNION ALL
+SELECT b.grupo, 'B. Evidencia causal', 12, 'Diferenca bruta entre os dois bracos',
+  round(CAST(100.0 * b.diferenca AS DOUBLE), 4), 'p.p.',
+  'Diferenca simples de entrega entre usar e nao usar o telefone recomendado.',
+  'Taxa do braco concordante menos taxa do braco divergente, sem nenhum controle.',
+  'E o ponto de partida. Ainda esta sujeito a diferencas de composicao entre os grupos, corrigidas nas linhas seguintes.',
+  concat('Em ', format_number(gp.volume_referencia, 0), ' disparos representa ',
+         format_number(b.diferenca * gp.volume_referencia, 0),
+         ' entregas a mais. Probabilidade de ser acaso: ', format_number(b.p_valor, 6), '.'),
+  'vt_res_05_bruto'
+FROM vt_res_05_bruto b JOIN vt_grupo_param gp ON b.grupo = gp.grupo
+UNION ALL
+SELECT e.grupo, 'B. Evidencia causal', 13, 'Diferenca controlada por campanha',
+  round(CAST(100.0 * e.diferenca AS DOUBLE), 4), 'p.p.',
+  'A mesma comparacao, feita dentro de cada campanha e depois combinada, ponderando pelo tamanho.',
+  'Estimador de Cochran, Mantel e Haenszel, que neutraliza qualquer diferenca de periodo, mensagem ou publico entre campanhas.',
+  'E a estimativa principal do estudo e o numero a levar para a discussao executiva. O efeito continuar forte apos esse controle e o que sustenta a leitura causal.',
+  concat('Calculado sobre ', format_number(e.campanhas_no_teste, 0), ' campanhas e ',
+         format_number(e.envios_no_teste, 0), ' disparos. Probabilidade de ser acaso: ',
+         format_number(e.p_valor, 6), '.'),
+  'vt_res_05_estratificado'
+FROM vt_res_05_estratificado e
+UNION ALL
+SELECT e.grupo, 'B. Evidencia causal', 14, 'Razao de chances controlada por campanha',
+  round(CAST(e.odds_ratio AS DOUBLE), 4), 'vezes',
+  'Quantas vezes a chance de entrega e maior ao usar o telefone recomendado, controlando por campanha.',
+  'Razao de chances de Mantel e Haenszel, com intervalo pela variancia de Robins, Breslow e Greenland.',
+  'Complementa a linha 13. Enquanto a diferenca em pontos percentuais depende do patamar de entrega, a razao de chances e comparavel entre campanhas com patamares distintos.',
+  concat('Intervalo de 95 por cento entre ', format_number(e.or_ic_inf, 3), ' e ',
+         format_number(e.or_ic_sup, 3), ' vezes.'),
+  'vt_res_05_estratificado'
+FROM vt_res_05_estratificado e
+UNION ALL
+SELECT p.grupo, 'B. Evidencia causal', 15, 'Diferenca no mesmo cliente',
+  round(CAST(100.0 * p.diferenca AS DOUBLE), 4), 'p.p.',
+  'Comparacao do mesmo CPF consigo mesmo, uma vez com o telefone recomendado e outra com um numero diferente.',
+  'Teste de McNemar sobre pares discordantes, com um envio sorteado por braco para equilibrar a exposicao.',
+  'Elimina qualquer caracteristica fixa da pessoa como explicacao alternativa, porque perfil, regiao e engajamento sao os mesmos nos dois lados.',
+  concat('Em ', format_number(p.n_pares, 0), ' clientes comparados, so o telefone recomendado entregou em ',
+         format_number(p.so_gr, 0), ' casos, contra ', format_number(p.so_outro, 0), ' do outro numero.'),
+  'vt_res_06_pareado'
+FROM vt_res_06_pareado p
+UNION ALL
+SELECT m.grupo, 'B. Evidencia causal', 16, 'Diferenca no mesmo cliente e na mesma campanha',
+  round(CAST(100.0 * m.diferenca AS DOUBLE), 4), 'p.p.',
+  'Versao mais restritiva, com pessoa e campanha fixas e apenas o telefone variando.',
+  'Teste de McNemar restrito aos casos em que o CRM disparou para dois numeros do mesmo cliente dentro da mesma campanha.',
+  'E o desenho mais proximo de um teste controlado que a base observacional permite montar. O valor menor que os anteriores e esperado, porque este recorte remove tambem o efeito de tempo entre campanhas.',
+  concat('Baseada em ', format_number(m.n_pares, 0), ' pares de disparo. Probabilidade de ser acaso: ',
+         format_number(m.p_valor, 6), '.'),
+  'vt_res_06_mesma_campanha'
+FROM vt_res_06_mesma_campanha m
+UNION ALL
+SELECT b.grupo, 'B. Evidencia causal', 17, 'Entrega com a regra simples do proprio CRM',
+  round(CAST(100.0 * b.taxa_regra_simples AS DOUBLE), 4), '%',
+  'Taxa de entrega quando o numero acionado e o mais usado pelo proprio CRM para aquele cliente, e esse numero difere do recomendado.',
+  'Entregas divididas por envios no grupo em que a heuristica de maior uso aponta um numero diferente do telefone de ranking 1.',
+  'E o comparativo justo para o Golden Record. Qualquer operacao consegue adotar essa regra sem investir em cadastro, entao o ganho do Golden Record precisa ser medido a partir daqui, e nao a partir do pior caso.',
+  concat('Baseada em ', format_number(b.envios_regra_simples, 0), ' disparos.'),
+  'vt_res_11_benchmark'
+FROM vt_res_11_benchmark b
+UNION ALL
+SELECT b.grupo, 'B. Evidencia causal', 18, 'Ganho do Golden Record sobre a regra simples',
+  round(CAST(100.0 * b.ganho_sobre_regra_simples AS DOUBLE), 4), 'p.p.',
+  'Quanto o telefone recomendado entrega a mais do que o numero mais acionado pelo proprio CRM.',
+  'Taxa do telefone recomendado menos taxa da regra simples.',
+  'E a resposta a objecao mais dura possivel, a de que qualquer heuristica razoavel produziria o mesmo efeito. Ganho positivo aqui significa que o valor vem do cadastro, e nao apenas de deixar de usar numeros ruins.',
+  concat('A regra simples ja captura ', format_number(100.0 * (1 - b.parcela_atribuivel_ao_cadastro), 1),
+         ' por cento do efeito total, e o cadastro acrescenta os ',
+         format_number(100.0 * b.parcela_atribuivel_ao_cadastro, 1), ' por cento restantes.'),
+  'vt_res_11_benchmark'
+FROM vt_res_11_benchmark b
+UNION ALL
+SELECT d.grupo, 'B. Evidencia causal', 19, 'Efeito mediano entre campanhas',
+  round(CAST(100.0 * d.mediana AS DOUBLE), 4), 'p.p.',
+  'Valor central do efeito quando cada campanha e tratada como uma observacao, sem ponderar por tamanho.',
+  'Mediana da diferenca entre os dois bracos, calculada campanha a campanha.',
+  'Compare com a diferenca ponderada. Se a mediana for proxima dela, o efeito e homogeneo. Se for muito menor, a media esta sendo puxada por poucas campanhas grandes.',
+  concat('Metade das campanhas fica entre ', format_number(100.0 * d.quartil_inferior, 2),
+         ' e ', format_number(100.0 * d.quartil_superior, 2), ' pontos percentuais, com extremos de ',
+         format_number(100.0 * d.minimo, 2), ' a ', format_number(100.0 * d.maximo, 2), '.'),
+  'vt_res_11_distribuicao'
+FROM vt_res_11_distribuicao d
+
+/* ---------------------------------------------------------------- BLOCO C -- */
+UNION ALL
+SELECT s.grupo, 'C. Robustez', 20, 'Campanhas em que o Golden Record venceu',
+  round(CAST(100.0 * s.fracao_vitorias AS DOUBLE), 4), '%',
+  'Percentual das campanhas com volume suficiente em que o telefone recomendado entregou mais.',
+  'Teste do sinal. Cada campanha vale um voto, independente do tamanho, o que complementa o estimador ponderado da linha 13.',
+  'Percentual alto indica efeito generalizado, e nao concentrado em poucas campanhas grandes. E o argumento mais simples contra a hipotese de coincidencia.',
+  concat(format_number(s.vitorias, 0), ' vitorias contra ', format_number(s.derrotas, 0),
+         ' derrotas em ', format_number(s.id_briefings, 0), ' campanhas avaliadas.'),
+  'vt_res_08_teste_sinal'
+FROM vt_res_08_teste_sinal s
+UNION ALL
+SELECT x.grupo, 'C. Robustez', 21, 'Diferenca excluindo a maior campanha',
+  round(CAST(100.0 * x.diferenca AS DOUBLE), 4), 'p.p.',
+  'Repeticao da comparacao bruta sem a campanha de maior volume.',
+  'Mesma conta da linha 12, removendo integralmente a campanha que mais pesa no total.',
+  'Valor proximo ao da linha 12 afasta a hipotese de que o resultado depende de uma unica campanha atipica.',
+  concat('Campanha removida do calculo: ', x.campanha_excluida, '.'),
+  'vt_res_08_sem_maior'
+FROM vt_res_08_sem_maior x
+UNION ALL
+SELECT r.grupo, 'C. Robustez', 22, 'Diferenca com regra exata de comparacao',
+  round(CAST(100.0 * r.diferenca AS DOUBLE), 4), 'p.p.',
+  'Repeticao da comparacao exigindo numero identico, sem tolerancia de formatacao.',
+  'Mesma conta da linha 12, tratando como concordante apenas a coincidencia caractere por caractere.',
+  'Valor proximo ao da linha 12 mostra que a conclusao nao e artefato da regra que despreza nono digito e codigo de pais.',
+  'Compare diretamente com a linha 12. Uma queda grande indicaria dependencia da regra de comparacao.',
+  'vt_res_08_regra_exata'
+FROM vt_res_08_regra_exata r
+UNION ALL
+SELECT sel.grupo, 'C. Robustez', 23, 'Diferenca de entrega entre clientes com e sem Golden Record',
+  round(CAST(100.0 * sel.diferenca AS DOUBLE), 4), 'p.p.',
+  'Compara a entrega dos dois grupos sem olhar qual telefone foi usado.',
+  'Taxa de entrega dos disparos com cobertura menos taxa dos disparos sem cobertura.',
+  'Nao invalida o efeito do telefone. Delimita ate onde a conclusao pode ser estendida: um valor alto indica que os clientes cobertos ja sao mais faceis de alcancar, e que extrapolar para os demais e premissa, nao medicao.',
+  concat('Sao ', format_number(sel.envios_sem_gr, 0), ' disparos sem cobertura, com taxa de ',
+         format_number(100.0 * sel.taxa_sem_gr, 2), ' por cento.'),
+  'vt_res_04_selecao'
+FROM vt_res_04_selecao sel
+UNION ALL
+SELECT f.grupo, 'C. Robustez', 24, 'Menor efeito entre as faixas de porte de campanha',
+  round(CAST(100.0 * min(f.diferenca) AS DOUBLE), 4), 'p.p.',
+  'Efeito na faixa de porte em que ele e mais fraco.',
+  'Diferenca entre os dois bracos calculada dentro de cada faixa de volume, tomando a menor delas.',
+  'Se o menor efeito ainda for positivo e relevante, a adocao nao depende do porte da campanha e pode ser generalizada.',
+  concat('Faixa com menor efeito: ', min_by(f.faixa_volume, f.diferenca), '.'),
+  'vt_res_11_por_faixa'
+FROM vt_res_11_por_faixa f GROUP BY f.grupo
+UNION ALL
+SELECT f.grupo, 'C. Robustez', 25, 'Maior efeito entre as faixas de porte de campanha',
+  round(CAST(100.0 * max(f.diferenca) AS DOUBLE), 4), 'p.p.',
+  'Efeito na faixa de porte em que ele e mais forte.',
+  'Diferenca entre os dois bracos calculada dentro de cada faixa de volume, tomando a maior delas.',
+  'A distancia entre esta linha e a anterior mede o quanto o porte da campanha modifica o efeito, e indica se vale priorizar por porte.',
+  concat('Faixa com maior efeito: ', max_by(f.faixa_volume, f.diferenca), '.'),
+  'vt_res_11_por_faixa'
+FROM vt_res_11_por_faixa f GROUP BY f.grupo
+UNION ALL
+SELECT i.grupo, 'C. Robustez', 26, 'Menor efeito entre as faixas de intensidade de contato',
+  round(CAST(100.0 * min(i.diferenca) AS DOUBLE), 4), 'p.p.',
+  'Efeito no perfil de cliente em que ele e mais fraco, considerando quantos SMS o cliente recebeu.',
+  'Diferenca entre os dois bracos calculada dentro de cada faixa de quantidade de envios por cliente.',
+  'Ataca a hipotese de que a concordancia de telefone apenas identifica clientes mais engajados. Se o efeito persiste em quem recebeu um unico SMS, a explicacao por engajamento perde forca.',
+  concat('Faixa com menor efeito: ', min_by(i.faixa, i.diferenca), '.'),
+  'vt_res_11_por_intensidade'
+FROM vt_res_11_por_intensidade i GROUP BY i.grupo
+UNION ALL
+SELECT i.grupo, 'C. Robustez', 27, 'Maior efeito entre as faixas de intensidade de contato',
+  round(CAST(100.0 * max(i.diferenca) AS DOUBLE), 4), 'p.p.',
+  'Efeito no perfil de cliente em que ele e mais forte.',
+  'Diferenca entre os dois bracos calculada dentro de cada faixa de quantidade de envios por cliente.',
+  'A distancia para a linha anterior indica se o ganho se concentra em um perfil especifico de cliente, o que orientaria a priorizacao.',
+  concat('Faixa com maior efeito: ', max_by(i.faixa, i.diferenca), '.'),
+  'vt_res_11_por_intensidade'
+FROM vt_res_11_por_intensidade i GROUP BY i.grupo
+UNION ALL
+SELECT r.grupo, 'C. Robustez', 28, 'Regioes em que o Golden Record entrega mais',
+  round(CAST(100.0 * r.fracao_com_ganho AS DOUBLE), 4), '%',
+  'Percentual dos codigos de area com volume suficiente em que o telefone recomendado entrega mais que os demais.',
+  'Diferenca entre os dois bracos calculada dentro de cada codigo de area, considerando apenas areas com pelo menos mil disparos em cada braco.',
+  'Verifica se o ganho e nacional ou concentrado em algumas pracas. Percentual alto indica que a adocao nao precisa de recorte geografico.',
+  concat('Foram ', format_number(r.ddds_avaliados, 0), ' areas avaliadas, com efeito mediano de ',
+         format_number(100.0 * r.mediana, 2), ' e extremos de ',
+         format_number(100.0 * r.minimo, 2), ' a ', format_number(100.0 * r.maximo, 2), ' pontos percentuais.'),
+  'vt_res_11_por_ddd'
+FROM vt_res_11_por_ddd r
+
+/* ---------------------------------------------------------------- BLOCO D -- */
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 30, 'Custo total dos disparos',
+  round(CAST(c.custo_total AS DOUBLE), 2), 'R$',
+  'Valor investido em disparos de SMS no periodo analisado.',
+  concat('Disparos multiplicados pelo custo unitario de ', format_number(c.custo_sms, 4), ' reais.'),
+  'E o denominador da conversa de eficiencia. Todo ganho apresentado adiante deve ser comparado a este montante.',
+  concat(format_number(c.disparos, 0), ' disparos ao custo unitario informado no parametro custo_sms.'),
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 31, 'Custo em disparos que nao chegam',
+  round(CAST(c.custo_desperdicado AS DOUBLE), 2), 'R$',
+  'Parcela do investimento gasta com SMS que nao foram entregues.',
+  'Insucessos multiplicados pelo custo unitario.',
+  'E dinheiro que sai do caixa sem nenhuma contrapartida. Reduzir esta linha e o objetivo direto de adotar o Golden Record.',
+  concat('Sao ', format_number(c.insucessos, 0), ' disparos sem entrega, ou ',
+         format_number(100.0 * c.fracao_desperdicada, 1), ' por cento do investimento.'),
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 32, 'Custo por SMS entregue hoje',
+  round(CAST(c.custo_por_entrega AS DOUBLE), 6), 'R$',
+  'Quanto custa, na pratica, cada SMS que efetivamente chega ao destino.',
+  'Custo unitario dividido pela taxa de entrega geral.',
+  'E a metrica de eficiencia de midia mais honesta, porque incorpora o desperdicio. O preco de tabela do disparo e menor do que o preco real de uma entrega.',
+  concat('O disparo custa ', format_number(c.custo_sms, 4), ' reais, mas cada entrega custa ',
+         format_number(c.custo_por_entrega, 4), ' reais.'),
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 33, 'Custo por entrega usando o telefone recomendado',
+  round(CAST(c.custo_por_entrega_concordante AS DOUBLE), 6), 'R$',
+  'Custo real de uma entrega quando o numero acionado e o telefone de ranking 1.',
+  'Custo unitario dividido pela taxa de entrega do braco concordante.',
+  'Mostra o patamar de eficiencia alcancavel. Quanto mais disparos migrarem para o telefone recomendado, mais o custo medio da linha 32 se aproxima deste valor.',
+  'Compare com a linha seguinte para dimensionar o desperdicio de acionar o numero errado.',
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 34, 'Custo por entrega usando outro telefone',
+  round(CAST(c.custo_por_entrega_discordante AS DOUBLE), 6), 'R$',
+  'Custo real de uma entrega quando o numero acionado difere do telefone de ranking 1.',
+  'Custo unitario dividido pela taxa de entrega do braco divergente.',
+  'E quanto a operacao paga hoje, por entrega, na parcela dos disparos que nao usa a recomendacao.',
+  concat('Uma entrega por esse caminho custa ',
+         format_number(100.0 * (c.custo_por_entrega_discordante / nullif(c.custo_por_entrega_concordante, 0) - 1), 1),
+         ' por cento a mais que pelo telefone recomendado.'),
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 35, 'Sobrecusto por entrega ao acionar o numero errado',
+  round(CAST(c.sobrecusto_por_entrega AS DOUBLE), 6), 'R$',
+  'Diferenca de custo entre alcancar o cliente pelo numero errado e pelo telefone recomendado.',
+  'Linha 34 menos linha 33.',
+  'E a metrica de bolso do estudo. Multiplicada pelo volume de entregas obtidas fora da recomendacao, dimensiona o desperdicio estrutural do processo atual.',
+  concat('A cada cem mil entregas obtidas fora da recomendacao, o sobrecusto e de ',
+         format_number(100000 * c.sobrecusto_por_entrega, 2), ' reais.'),
+  'vt_res_09_custo_atual'
+FROM vt_res_09_custo_atual c
+UNION ALL
+SELECT cc.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 36 + cc.ordem,
+  concat('Valor equivalente em midia, cenario ', cc.cenario),
+  round(CAST(cc.valor_equivalente_midia AS DOUBLE), 2), 'R$',
+  'Quanto custaria comprar hoje, em disparos adicionais, o mesmo numero de entregas que a adocao do Golden Record produziria.',
+  'Entregas liquidas do cenario multiplicadas pelo custo real por entrega da linha 32.',
+  CASE cc.cenario
+    WHEN 'TETO' THEN 'Limite superior logico, nao previsao. Assume que todo insucesso com telefone divergente viraria entrega, o que nenhum canal alcanca.'
+    WHEN 'CALIBRADO_GLOBAL' THEN 'Aplica aos candidatos a taxa que o telefone recomendado de fato tem quando e usado, medida em toda a base do grupo.'
+    WHEN 'CALIBRADO_CAMPANHA' THEN 'Cenario central recomendado. Cada candidato recebe a taxa observada do telefone recomendado dentro da propria campanha.'
+    WHEN 'EVIDENCIA_EXTRAPOLADA' THEN 'Cenario de estresse. Aplica aos candidatos a taxa do telefone recomendado medida so entre clientes em que ele ja foi acionado, um subgrupo mais dificil, e as entregas em risco a taxa medida entre os sucessos desse subgrupo. Costuma ficar abaixo dos demais e pode ficar negativo. As linhas 72 e 73 do bloco E mostram o mesmo subgrupo nos briefings promocionais.'
+    ELSE 'Chao de seguranca. Conta apenas o que ja foi observado, sem extrapolar para clientes sem historico.'
+  END,
+  concat('Entregas liquidas de ', format_number(cc.entregas_liquidas, 0),
+         ', levando o custo por entrega de ', format_number(cc.custo_por_entrega, 4),
+         ' para ', format_number(cc.custo_por_entrega_projetado, 4), ' reais.'),
+  'vt_res_09_custo_cenario'
+FROM vt_res_09_custo_cenario cc
+UNION ALL
+SELECT cc.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 42, 'Queda no custo por entrega, cenario central',
+  round(CAST(cc.queda_custo_por_entrega AS DOUBLE), 6), 'R$',
+  'Reducao do custo real de cada entrega apos a adocao, no cenario central.',
+  'Custo por entrega atual menos custo por entrega projetado, mantendo o mesmo orcamento de disparos.',
+  'Traduz o ganho para a linguagem de eficiencia de midia. O orcamento nao muda, o que muda e quantas entregas ele compra.',
+  concat('Queda de ', format_number(100.0 * cc.queda_custo_por_entrega / nullif(cc.custo_por_entrega, 0), 2),
+         ' por cento no custo por entrega.'),
+  'vt_res_09_custo_cenario'
+FROM vt_res_09_custo_cenario cc WHERE cc.cenario = 'CALIBRADO_CAMPANHA'
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 43, 'Campanhas que concentram metade do ganho',
+  CAST(c.campanhas_para_metade AS DOUBLE), 'campanhas',
+  'Quantidade de campanhas necessarias, da maior para a menor, para acumular metade das entregas recuperadas.',
+  'Ordenacao das campanhas por entregas liquidas do cenario central, com soma acumulada ate cruzar metade do total.',
+  'Define a estrategia de adocao. Numero pequeno significa que um piloto dirigido a poucas campanhas captura a maior parte do valor, com muito menos esforco que a adocao geral.',
+  concat('De ', format_number(c.campanhas_com_ganho, 0), ' campanhas com ganho positivo.'),
+  'vt_res_11_concentracao'
+FROM vt_res_11_concentracao c
+UNION ALL
+SELECT c.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 44, 'Participacao das dez maiores campanhas no ganho',
+  round(CAST(100.0 * c.fracao_dez_maiores AS DOUBLE), 4), '%',
+  'Fracao das entregas recuperadas que vem das dez campanhas de maior ganho.',
+  'Soma acumulada das entregas liquidas das dez primeiras campanhas, dividida pelo total.',
+  'Complementa a linha anterior. Participacao alta favorece comecar por essas campanhas e medir resultado antes de generalizar.',
+  concat('Sao ', format_number(c.ganho_das_dez_maiores, 0), ' entregas de um total de ',
+         format_number(c.total_liquidas, 0), '.'),
+  'vt_res_11_concentracao'
+FROM vt_res_11_concentracao c
+
+UNION ALL
+SELECT sg.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 45, 'Parcela dos disparos em campanhas transacionais',
+  round(CAST(100.0 * sg.parcela_disparos AS DOUBLE), 4), '%',
+  'Fracao dos disparos da janela que pertence a briefings sem economia de conversao informada, tratados como transacionais.',
+  'Disparos dos briefings fora da secao 00.5 divididos por todos os disparos do escopo.',
+  'Delimita os dois escopos da saida. Nas campanhas transacionais o valor do Golden Record e parar de pagar por SMS que nao chega e passar a entregar a mensagem, e so pode ser lido em midia. Nos briefings promocionais o mesmo ganho tambem vira receita, no bloco E.',
+  concat('Sao ', format_number(sg.disparos, 0), ' disparos em ', format_number(sg.briefings, 0),
+         ' briefings transacionais, contra ', format_number(pt.disparos_promo, 0), ' disparos em ',
+         format_number(pt.briefings_promo, 0), ' briefings promocionais.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_ponte pt ON sg.grupo = pt.grupo
+WHERE sg.segmento = 'TRANSACIONAL'
+UNION ALL
+SELECT sg.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 46, 'Entregas liquidas nas campanhas transacionais, cenario central',
+  round(CAST(sg.entregas_liquidas AS DOUBLE), 0), 'entregas',
+  'Saldo de entregas recuperadas menos perdidas, no cenario central, restrito aos briefings transacionais.',
+  'Recuperadas menos perdidas do cenario calibrado por campanha, somadas sobre os briefings fora da secao 00.5.',
+  'E a parte do ganho fisico que o bloco E nao converte em receita, e por isso precisa ser lida aqui. Cada uma destas entregas e um aviso, um codigo ou uma confirmacao que hoje nao chega e passaria a chegar, sem nenhum disparo a mais.',
+  concat('Equivalem a ', format_number(100.0 * sg.pp_incremental, 2),
+         ' pontos percentuais de entrega nos disparos transacionais com cobertura e a ',
+         format_number(100.0 * sg.entregas_liquidas / nullif(pt.liquidas_total, 0), 1),
+         ' por cento do saldo liquido de todas as campanhas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_ponte pt ON sg.grupo = pt.grupo
+WHERE sg.segmento = 'TRANSACIONAL'
+UNION ALL
+SELECT sg.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 47, 'Entregas liquidas nos briefings promocionais, cenario central',
+  round(CAST(sg.entregas_liquidas AS DOUBLE), 0), 'entregas',
+  'Saldo de entregas recuperadas menos perdidas, no cenario central, restrito aos briefings da secao 00.5.',
+  'Recuperadas menos perdidas do cenario calibrado por campanha, somadas sobre os briefings promocionais.',
+  'E o saldo fisico que o bloco E converte em conversoes e receita. Somado a linha 46 reproduz a linha 60 de todas as campanhas. A leitura em midia deste saldo ja esta nas linhas 37 a 41; a leitura em receita comeca na linha 50.',
+  concat('Equivalem a ', format_number(100.0 * sg.pp_incremental, 2),
+         ' pontos percentuais de entrega nos disparos promocionais com cobertura e a ',
+         format_number(100.0 * sg.entregas_liquidas / nullif(pt.liquidas_total, 0), 1),
+         ' por cento do saldo liquido de todas as campanhas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_ponte pt ON sg.grupo = pt.grupo
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 48, 'Custo em disparos transacionais que nao chegam',
+  round(CAST(sg.custo_desperdicado AS DOUBLE), 2), 'R$',
+  'Parcela da linha 31 gasta com SMS transacionais nao entregues.',
+  'Insucessos dos briefings transacionais multiplicados pelo custo unitario.',
+  'Em campanha transacional o SMS nao entregue e duplamente ruim: custa e deixa o cliente sem a informacao que motivou o envio. Esta linha mede so o primeiro efeito; o segundo nao tem preco no estudo, mas e o argumento operacional mais forte a favor do Golden Record.',
+  concat('Sao ', format_number(sg.insucessos, 0), ' disparos transacionais sem entrega, ou ',
+         format_number(100.0 * sg.insucessos / nullif(sg.disparos, 0), 1), ' por cento dos disparos do segmento.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg
+WHERE sg.segmento = 'TRANSACIONAL'
+UNION ALL
+SELECT sg.grupo, 'D. Valuation pelo custo de disparo, todas as campanhas', 49, 'Valor equivalente em midia nas campanhas transacionais, cenario central',
+  round(CAST(sg.valor_equivalente_midia AS DOUBLE), 2), 'R$',
+  'Quanto custaria comprar hoje, em disparos adicionais, as entregas liquidas da linha 46.',
+  'Entregas liquidas transacionais multiplicadas pelo custo real por entrega da linha 32.',
+  'E o valor do Golden Record no segmento em que nao ha receita para medir. Deve ser apresentado ao lado da receita do bloco E, nunca somado a ela, porque sao reguas diferentes aplicadas a entregas diferentes.',
+  concat('Parcela transacional da linha 39, que vale ', format_number(cc.valor_equivalente_midia, 2),
+         ' reais para todas as campanhas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg
+JOIN vt_res_09_custo_cenario cc ON sg.grupo = cc.grupo AND cc.cenario = 'CALIBRADO_CAMPANHA'
+WHERE sg.segmento = 'TRANSACIONAL'
+
+/* ---------------------------------------------------------------- BLOCO E -- */
+UNION ALL
+SELECT pt.grupo, 'E. Valuation pela conversao, briefings promocionais', 50, 'Briefings promocionais com economia informada',
+  CAST(pt.briefings_promo AS DOUBLE), 'briefings',
+  'Briefings da secao 00.5 com disparo na janela. Sao os unicos com taxa de conversao e ticket conhecidos, e por isso os unicos em que o ganho de entrega pode ser lido como receita. Todo briefing fora da lista e tratado como transacional.',
+  'Contagem de briefings listados na secao 00.5 que aparecem na base de disparos do periodo.',
+  'Aqui o escopo muda. Os blocos anteriores olham todas as campanhas da janela; este bloco olha so os briefings promocionais. Os numeros deste bloco sao um recorte dos anteriores, nao uma versao alternativa deles, e a linha 47 mostra exatamente que parte do saldo fisico esta sendo convertida em receita.',
+  concat('A janela tem ', format_number(pt.briefings_total, 0), ' briefings. ',
+         format_number(pt.briefings_promo, 0), ' sao promocionais, de ',
+         format_number(pt.briefings_parametrizados, 0), ' informados na secao 00.5, e respondem por ',
+         format_number(100.0 * pt.parcela_disparos_promo, 1), ' por cento dos disparos e ',
+         format_number(100.0 * pt.parcela_liquidas_promo, 1),
+         ' por cento das entregas liquidas do cenario central. Briefings e economias: ',
+         coalesce(d.lista_economia, 'nenhum'), '.'),
+  'vt_res_10_ponte'
+FROM vt_res_10_ponte pt LEFT JOIN vt_res_10_briefing_destaques d ON pt.grupo = d.grupo
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 51, 'Entregas atuais nos briefings promocionais',
+  CAST(a.entregas AS DOUBLE), 'entregas',
+  'SMS que chegaram ao destino nos briefings promocionais, com o telefone que o CRM usou.',
+  'Soma das entregas dos briefings da secao 00.5.',
+  'E o ponto de partida da historia. Toda conversao e toda receita de hoje nascem destas entregas, e todo ganho estimado adiante e acrescimo sobre elas.',
+  concat('De ', format_number(pt.disparos_promo, 0), ' disparos promocionais. O briefing de maior volume e o ',
+         d.brf_maior_volume, ', com ', format_number(d.entregas_maior_volume, 0), ' entregas.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a
+JOIN vt_res_10_ponte pt ON a.grupo = pt.grupo
+JOIN vt_res_10_briefing_destaques d ON a.grupo = d.grupo
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 52, 'Conversoes estimadas hoje',
+  round(CAST(a.conversoes_hoje AS DOUBLE), 1), 'conversoes',
+  'Conversoes que as entregas atuais geram, calculadas briefing a briefing com a taxa de cada um.',
+  'Soma, sobre os briefings, das entregas multiplicadas pela taxa de conversao do proprio briefing.',
+  'Como as taxas variam muito entre briefings, o volume de entregas nao diz onde estao as conversoes. Um briefing pequeno com taxa alta pode responder por mais conversoes que um grande com taxa baixa.',
+  concat('O briefing ', d.brf_maior_conversoes_atuais, ' responde por ',
+         format_number(100.0 * d.share_conversoes_atuais_maior, 1), ' por cento das conversoes de hoje.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a JOIN vt_res_10_briefing_destaques d ON a.grupo = d.grupo
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 53, 'Receita estimada hoje',
+  round(CAST(a.receita_hoje AS DOUBLE), 2), 'R$',
+  'Retorno que as entregas atuais ja geram, somando briefing a briefing com a taxa e o ticket de cada um.',
+  'Soma das conversoes de cada briefing multiplicadas pelo ticket do proprio briefing.',
+  'E a linha de base financeira. Toda receita incremental deve ser lida como avanco a partir daqui. O retorno por real investido em disparo mostra a produtividade atual do canal.',
+  concat('O briefing ', d.brf_maior_receita_atual, ' gera ', format_number(d.receita_atual_maior, 2),
+         ' reais, ou ', format_number(100.0 * d.share_receita_atual_maior, 1),
+         ' por cento do total. Retorno atual de ', format_number(a.retorno_por_real, 2),
+         ' reais por real investido em disparo.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a JOIN vt_res_10_briefing_destaques d ON a.grupo = d.grupo
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 54, 'Taxa de conversao efetiva',
+  round(CAST(100.0 * a.taxa_conversao AS DOUBLE), 4), '%',
+  'Media das taxas de conversao dos briefings, ponderada pelas entregas de cada um.',
+  'Conversoes estimadas hoje divididas pelas entregas atuais.',
+  'Nao e uma premissa, e um resultado. Serve para comparar com a taxa geral do grupo e para entender a mistura de briefings. A amplitude entre o menor e o maior briefing mostra o quanto a conta por briefing importa.',
+  concat('Vai de ', format_number(100.0 * d.menor_taxa, 2), ' por cento no briefing ', d.brf_menor_taxa,
+         ' a ', format_number(100.0 * d.maior_taxa, 2), ' por cento no briefing ', d.brf_maior_taxa, '.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a JOIN vt_res_10_briefing_destaques d ON a.grupo = d.grupo
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 55, 'Ticket medio efetivo',
+  round(CAST(a.valor_conversao AS DOUBLE), 2), 'R$',
+  'Media dos tickets dos briefings, ponderada pelas conversoes de cada um.',
+  'Receita estimada hoje dividida pelas conversoes estimadas hoje.',
+  'Assim como a taxa, e um resultado e nao uma premissa. Ticket e taxa juntos definem quanto vale cada entrega em cada briefing, e e isso que faz a receita recuperada depender de onde a entrega acontece.',
+  concat('Vai de ', format_number(d.menor_ticket, 2), ' reais no briefing ', d.brf_menor_ticket,
+         ' a ', format_number(d.maior_ticket, 2), ' reais no briefing ', d.brf_maior_ticket, '.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a JOIN vt_res_10_briefing_destaques d ON a.grupo = d.grupo
+
+/* Etapa 2. O que o Golden Record muda                                          */
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 56, 'Candidatos a recuperacao',
+  CAST(sg.candidatos AS DOUBLE), 'envios',
+  'SMS que falharam nos briefings promocionais e para os quais o Golden Record indicaria um telefone diferente do usado.',
+  'Insucessos promocionais com cobertura do Golden Record cujo numero acionado difere do telefone de ranking 1.',
+  'E o espaco em que o Golden Record pode agir. Ainda nao e ganho, porque nem todo numero diferente entregaria. As proximas linhas aplicam a taxa real de entrega do telefone recomendado a este volume.',
+  concat('Sao ', format_number(100.0 * sg.candidatos / nullif(sg.insucessos, 0), 1),
+         ' por cento dos ', format_number(sg.insucessos, 0), ' insucessos dos briefings promocionais.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 57, 'Entregas recuperadas, cenario central',
+  round(CAST(sg.recuperadas AS DOUBLE), 0), 'entregas',
+  'Quantos dos candidatos passariam a ser entregues, usando em cada briefing a taxa de entrega que o telefone recomendado de fato tem naquele briefing.',
+  'Para cada briefing, candidatos multiplicados pela taxa de entrega do braco concordante do proprio briefing. Depois, soma.',
+  'E o lado positivo da troca de telefone. A taxa aplicada e medida, nao suposta: vem dos disparos em que o CRM ja usou, por coincidencia, o telefone recomendado naquele mesmo briefing.',
+  concat('Taxa efetiva de recuperacao de ', format_number(100.0 * sg.recuperadas / nullif(sg.candidatos, 0), 2),
+         ' por cento. O briefing ', d.brf_maior_recuperadas, ' e o que mais recupera, com ',
+         format_number(d.maior_recuperadas, 0), ' entregas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_briefing_destaques d ON sg.grupo = d.grupo
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 58, 'Entregas atuais em risco',
+  CAST(sg.em_risco AS DOUBLE), 'entregas',
+  'SMS promocionais que hoje sao entregues com um numero diferente do recomendado e que a adocao substituiria.',
+  'Entregas promocionais com cobertura do Golden Record cujo numero acionado difere do telefone de ranking 1.',
+  'E a primeira pergunta de quem teme a mudanca, e por isso vem antes do ganho. Trocar um numero que funciona tem custo, e a linha seguinte estima esse custo com a mesma taxa medida por briefing.',
+  concat('Equivalem a ', format_number(100.0 * sg.em_risco / nullif(sg.entregas, 0), 1),
+         ' por cento das entregas atuais dos briefings promocionais.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 59, 'Entregas perdidas, cenario central',
+  round(CAST(sg.perdidas AS DOUBLE), 0), 'entregas',
+  'Quantas das entregas em risco deixariam de acontecer ao trocar para o telefone recomendado.',
+  'Para cada briefing, entregas em risco multiplicadas por um menos a taxa de entrega do telefone recomendado naquele briefing. Depois, soma.',
+  'E o lado negativo da troca, ja descontado no saldo. Quanto maior a taxa do telefone recomendado no briefing, menor a perda, porque o novo numero tambem tende a entregar.',
+  concat('O briefing ', d.brf_maior_perdidas, ' concentra a maior perda, com ',
+         format_number(d.maior_perdidas, 0), ' entregas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_briefing_destaques d ON sg.grupo = d.grupo
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 60, 'Entregas liquidas, cenario central',
+  round(CAST(sg.entregas_liquidas AS DOUBLE), 0), 'entregas',
+  'Ganho liquido de entregas nos briefings promocionais ao adotar o telefone recomendado: recuperadas menos perdidas.',
+  'Linha 57 menos linha 59. Identica a linha 47.',
+  'E o numero fisico que o Golden Record entrega nos briefings promocionais, antes de qualquer conta financeira. Tudo que vem a seguir e a traducao deste saldo em conversoes e receita, briefing a briefing.',
+  concat('O briefing ', d.brf_maior_liquidas, ' responde por ',
+         format_number(100.0 * d.share_liquidas_maior, 1), ' por cento do saldo, com ',
+         format_number(d.maior_liquidas, 0), ' entregas liquidas.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_briefing_destaques d ON sg.grupo = d.grupo
+WHERE sg.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sg.grupo, 'E. Valuation pela conversao, briefings promocionais', 61, 'Lift na taxa de entrega',
+  round(CAST(100.0 * sg.pp_incremental AS DOUBLE), 4), 'p.p.',
+  'Quanto a taxa de entrega dos briefings promocionais subiria com a adocao, em pontos percentuais.',
+  'Entregas liquidas divididas pelos disparos promocionais com cobertura do Golden Record.',
+  'E o lift do Golden Record em linguagem de canal. Varia entre briefings porque depende de quantos disparos usam numero divergente e de quao bom e o telefone recomendado naquele publico.',
+  concat('Vai de ', format_number(100.0 * d.menor_lift, 2), ' pontos no briefing ', d.brf_menor_lift,
+         ' a ', format_number(100.0 * d.maior_lift, 2), ' pontos no briefing ', d.brf_maior_lift, '.'),
+  'vt_res_09_segmento'
+FROM vt_res_09_segmento sg JOIN vt_res_10_briefing_destaques d ON sg.grupo = d.grupo
+WHERE sg.segmento = 'PROMOCIONAL'
+
+/* Etapa 3. O que isso vale                                                     */
+UNION ALL
+SELECT cv.grupo, 'E. Valuation pela conversao, briefings promocionais', 62, 'Conversoes incrementais, cenario central',
+  round(CAST(cv.conversoes_incrementais AS DOUBLE), 1), 'conversoes',
+  'Conversoes adicionais geradas pelas entregas liquidas, calculadas briefing a briefing.',
+  'Para cada briefing, entregas liquidas multiplicadas pela taxa de conversao do proprio briefing. Depois, soma.',
+  'Aqui a historia muda de canal para negocio. Entregas liquidas iguais valem conversoes muito diferentes conforme o briefing, e e por isso que a conta e feita por briefing antes de somar.',
+  concat('O briefing ', d.brf_maior_conv_incr, ' gera ', format_number(d.maior_conv_incr, 1),
+         ' das conversoes adicionais.'),
+  'vt_res_10_conversao_cenario'
+FROM vt_res_10_conversao_cenario cv JOIN vt_res_10_briefing_destaques d ON cv.grupo = d.grupo
+WHERE cv.cenario = 'CALIBRADO_CAMPANHA'
+UNION ALL
+SELECT cv.grupo, 'E. Valuation pela conversao, briefings promocionais', 63, 'Receita incremental no periodo, cenario central',
+  round(CAST(cv.receita_incremental AS DOUBLE), 2), 'R$',
+  'Receita adicional que o Golden Record produziria no periodo coberto, somando o ganho de cada briefing promocional convertido pela economia daquele briefing.',
+  'Para cada briefing, conversoes incrementais multiplicadas pelo ticket do proprio briefing. Depois, soma.',
+  'E o numero central do valuation e o que deve ir para a decisao. Nao depende de premissa unica: cada briefing entra com a taxa e o ticket que a operacao informou para ele. A faixa de cenarios nas linhas 67 a 71 delimita a incerteza de premissa em torno deste valor, e a linha 79 o anualiza.',
+  concat('Os tres maiores sao ', d.brf_top1, ' com ', format_number(d.receita_top1, 2), ' reais, ',
+         d.brf_top2, ' com ', format_number(d.receita_top2, 2), ' reais e ',
+         d.brf_top3, ' com ', format_number(d.receita_top3, 2), ' reais.'),
+  'vt_res_10_conversao_cenario'
+FROM vt_res_10_conversao_cenario cv JOIN vt_res_10_briefing_destaques d ON cv.grupo = d.grupo
+WHERE cv.cenario = 'CALIBRADO_CAMPANHA'
+UNION ALL
+SELECT cv.grupo, 'E. Valuation pela conversao, briefings promocionais', 64, 'Crescimento sobre a receita atual',
+  round(CAST(100.0 * cv.crescimento_sobre_receita_atual AS DOUBLE), 4), '%',
+  'Quanto a receita incremental representa sobre a receita que os briefings ja geram hoje.',
+  'Linha 63 dividida pela linha 53.',
+  'Traduz o ganho em termos relativos, que e como uma diretoria compara iniciativas. Crescimento de dois digitos sobre receita existente, sem novo investimento em midia, e raro para uma acao de dado.',
+  concat('O briefing ', d.brf_maior_crescimento, ' e o que mais cresce sobre a propria base, com ',
+         format_number(100.0 * d.maior_crescimento, 2), ' por cento.'),
+  'vt_res_10_conversao_cenario'
+FROM vt_res_10_conversao_cenario cv JOIN vt_res_10_briefing_destaques d ON cv.grupo = d.grupo
+WHERE cv.cenario = 'CALIBRADO_CAMPANHA'
+UNION ALL
+SELECT d.grupo, 'E. Valuation pela conversao, briefings promocionais', 65, 'Briefings em que o Golden Record reduziria a receita',
+  CAST(d.briefings_negativos AS DOUBLE), 'briefings',
+  'Briefings cujo saldo liquido no cenario central e negativo, porque a troca de telefone perderia mais entregas do que recuperaria.',
+  'Contagem de briefings com receita incremental negativa no cenario central.',
+  'E a lista de excecoes. Nesses briefings a adocao deve ser seletiva: manter o numero atual onde ele entrega e usar o recomendado apenas nos insucessos. Excluir esses briefings da substituicao geral aumenta o ganho total.',
+  CASE WHEN d.briefings_negativos > 0
+       THEN concat('Briefings: ', d.lista_negativos, '. Receita em risco de ',
+                   format_number(abs(d.receita_negativa), 2), ' reais, ja descontada da linha 63.')
+       ELSE 'Nenhum briefing fica negativo neste cenario. A adocao pode ser geral.'
+  END,
+  'vt_res_10_briefing_destaques'
+FROM vt_res_10_briefing_destaques d
+UNION ALL
+SELECT d.grupo, 'E. Valuation pela conversao, briefings promocionais', 66, 'Receita incremental com adocao seletiva',
+  round(CAST(d.receita_positiva AS DOUBLE), 2), 'R$',
+  'Receita incremental do cenario central considerando apenas os briefings com saldo positivo.',
+  'Soma da receita incremental dos briefings em que ela e positiva.',
+  'E o ganho de aplicar o Golden Record so onde ele ajuda. A diferenca para a linha 63 e o valor de ter a lista de excecoes em maos antes de implantar.',
+  concat('Contra ', format_number(d.receita_positiva + d.receita_negativa, 2),
+         ' reais da adocao indiscriminada.'),
+  'vt_res_10_briefing_destaques'
+FROM vt_res_10_briefing_destaques d
+
+/* Etapa 4. A faixa de cenarios                                                 */
+UNION ALL
+SELECT cv.grupo, 'E. Valuation pela conversao, briefings promocionais', 66 + cv.ordem,
+  concat('Receita incremental no periodo, cenario ', cv.cenario),
+  round(CAST(cv.receita_incremental AS DOUBLE), 2), 'R$',
+  'Receita adicional no cenario, somando briefing a briefing com a economia de cada um.',
+  'Para cada briefing, entregas recuperadas menos perdidas no cenario, vezes a taxa e o ticket do briefing. Depois, soma.',
+  CASE cv.cenario
+    WHEN 'TETO' THEN 'Limite superior logico, nao previsao. Assume que todo candidato viraria entrega, o que nenhum canal alcanca. Use para dizer que nem no melhor caso o ganho passaria deste valor.'
+    WHEN 'CALIBRADO_GLOBAL' THEN 'Aplica a cada briefing a taxa de entrega do telefone recomendado medida na base inteira do grupo. Mais realista que o teto, mas ignora que cada briefing tem seu proprio patamar de entrega.'
+    WHEN 'CALIBRADO_CAMPANHA' THEN 'Cenario central, identico a linha 63. Cada briefing recebe a taxa de entrega do telefone recomendado medida dentro do proprio briefing.'
+    WHEN 'EVIDENCIA_EXTRAPOLADA' THEN 'Cenario de estresse. Usa, em cada briefing, a taxa do telefone recomendado medida apenas entre clientes em que ele ja foi acionado, que e um subgrupo mais dificil. Costuma ficar abaixo dos demais e pode ser negativo. Descreve o subgrupo dificil, nao o desempenho esperado. Leia com as linhas 72 e 73.'
+    ELSE 'Chao de seguranca. Conta em cada briefing apenas os casos em que o telefone recomendado ja foi acionado para o mesmo cliente e comprovadamente entregou, descontando perdas igualmente comprovadas. Nao extrapola nada.'
+  END,
+  concat('Entregas liquidas de ', format_number(cv.entregas_liquidas, 0), ' e ',
+         format_number(cv.conversoes_incrementais, 1), ' conversoes adicionais, ou ',
+         format_number(100.0 * cv.pp_incremental, 2), ' ponto percentual de entrega.'),
+  'vt_res_10_conversao_cenario'
+FROM vt_res_10_conversao_cenario cv
+
+/* Etapa 5. O que sustenta e o que limita o numero                              */
+UNION ALL
+SELECT ev.grupo, 'E. Valuation pela conversao, briefings promocionais', 72,
+  'Entrega do telefone recomendado entre clientes em que ele ja foi acionado',
+  round(CAST(100.0 * ev.taxa_historica AS DOUBLE), 4), '%',
+  'Taxa de entrega do telefone recomendado nos briefings promocionais, restrita aos candidatos para os quais esse numero ja foi acionado alguma vez.',
+  'Media da taxa do braco concordante, cliente a cliente, dentro desse subgrupo.',
+  'Explica o cenario de evidencia extrapolada. Compare com a linha 10: a distancia mostra que o subgrupo com historico e formado por clientes mais dificeis, e que projetar a taxa deles para toda a base subestima o Golden Record.',
+  concat('Sao ', format_number(ev.candidatos - ev.sem_historico, 0), ' candidatos com historico, dos quais ',
+         format_number(ev.com_entrega_provada, 0), ' ja tiveram entrega comprovada no numero recomendado.'),
+  'vt_res_07_evidencia_segmento'
+FROM vt_res_07_evidencia_segmento ev
+WHERE ev.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT ev.grupo, 'E. Valuation pela conversao, briefings promocionais', 73, 'Candidatos sem historico do telefone recomendado',
+  round(CAST(100.0 * ev.fracao_sem_historico AS DOUBLE), 4), '%',
+  'Fracao dos candidatos promocionais cujo telefone recomendado nunca foi acionado para aquele cliente.',
+  'Candidatos sem nenhum disparo concordante registrado, divididos pelo total de candidatos.',
+  'Mede o grau de extrapolacao dos cenarios calibrados. Quanto maior, mais o resultado depende de projecao e mais util e ler o piso e o teto juntos.',
+  concat('De ', format_number(ev.candidatos, 0), ' candidatos, ',
+         format_number(ev.sem_historico, 0), ' nunca tiveram o numero recomendado acionado.'),
+  'vt_res_07_evidencia_segmento'
+FROM vt_res_07_evidencia_segmento ev
+WHERE ev.segmento = 'PROMOCIONAL'
+UNION ALL
+SELECT sen.grupo, 'E. Valuation pela conversao, briefings promocionais', 74, 'Receita incremental com metade da conversao',
+  round(CAST(sen.receita_incremental AS DOUBLE), 2), 'R$',
+  'Cenario central recalculado com a taxa de conversao de todos os briefings reduzida a metade e os tickets mantidos.',
+  'Receita incremental do cenario central multiplicada por meio.',
+  'Sensibilidade a premissa comercial mais incerta. Se o projeto continua atrativo aqui, a decisao nao depende de acertar a conversao.',
+  concat('Taxa efetiva aplicada de ', format_number(100.0 * sen.taxa_aplicada, 4), ' por cento.'),
+  'vt_res_10_sensibilidade'
+FROM vt_res_10_sensibilidade sen
+WHERE sen.cenario = 'CALIBRADO_CAMPANHA' AND sen.rotulo_taxa = 'conversao_metade' AND sen.rotulo_valor = 'ticket_base'
+UNION ALL
+SELECT sen.grupo, 'E. Valuation pela conversao, briefings promocionais', 75, 'Receita incremental com o dobro da conversao',
+  round(CAST(sen.receita_incremental AS DOUBLE), 2), 'R$',
+  'Cenario central recalculado com a taxa de conversao de todos os briefings dobrada e os tickets mantidos.',
+  'Receita incremental do cenario central multiplicada por dois.',
+  'Completa a faixa de sensibilidade. A grade de nove combinacoes de taxa e ticket esta na view de origem.',
+  concat('Taxa efetiva aplicada de ', format_number(100.0 * sen.taxa_aplicada, 4), ' por cento.'),
+  'vt_res_10_sensibilidade'
+FROM vt_res_10_sensibilidade sen
+WHERE sen.cenario = 'CALIBRADO_CAMPANHA' AND sen.rotulo_taxa = 'conversao_dobro' AND sen.rotulo_valor = 'ticket_base'
+UNION ALL
+SELECT fe.grupo, 'E. Valuation pela conversao, briefings promocionais', 76, 'Receita incremental, limite inferior estatistico',
+  round(CAST(fe.receita_inf AS DOUBLE), 2), 'R$',
+  'Piso da receita incremental dos briefings promocionais considerando apenas a margem de erro da taxa de entrega medida para o telefone recomendado.',
+  'Cenario calibrado global recalculado, briefing a briefing, com a taxa do telefone recomendado no limite inferior do seu intervalo de Wilson de 95 por cento.',
+  'Esta faixa e diferente da faixa de cenarios. Os cenarios variam a premissa sobre o telefone recomendado. Esta linha varia apenas o acaso amostral, com a premissa fixa. Intervalo estreito indica que o volume de dados torna a medicao precisa.',
+  concat('A taxa do telefone recomendado fica entre ', format_number(100.0 * fe.taxa_inf, 2), ' e ',
+         format_number(100.0 * fe.taxa_sup, 2), ' por cento com 95 por cento de confianca. No centro do intervalo a receita e de ',
+         format_number(fe.receita_central, 2), ' reais, que reproduz a linha 68.'),
+  'vt_res_11_faixa_estatistica'
+FROM vt_res_11_faixa_estatistica fe
+UNION ALL
+SELECT fe.grupo, 'E. Valuation pela conversao, briefings promocionais', 77, 'Receita incremental, limite superior estatistico',
+  round(CAST(fe.receita_sup AS DOUBLE), 2), 'R$',
+  'Teto da receita incremental dos briefings promocionais considerando apenas a margem de erro da taxa de entrega medida para o telefone recomendado.',
+  'Cenario calibrado global recalculado, briefing a briefing, com a taxa do telefone recomendado no limite superior do seu intervalo de Wilson de 95 por cento.',
+  'Leia com a linha anterior. A largura entre as duas e a incerteza da medicao, e costuma ser muito menor que a distancia entre o piso e o teto de cenarios, que e a incerteza de premissa.',
+  'Apresentadas juntas, as duas incertezas mostram que a duvida relevante e sobre premissa, nao sobre volume de dados.',
+  'vt_res_11_faixa_estatistica'
+FROM vt_res_11_faixa_estatistica fe
+UNION ALL
+SELECT a.grupo, 'E. Valuation pela conversao, briefings promocionais', 78, 'Valor de cada ponto percentual de entrega',
+  round(CAST(a.valor_por_ponto_percentual AS DOUBLE), 2), 'R$',
+  'Quanto vale, em receita, elevar em um ponto percentual a taxa de entrega de todos os briefings do escopo.',
+  'Soma, sobre os briefings, de um centesimo dos disparos com cobertura do briefing multiplicado pela taxa e pelo ticket daquele briefing.',
+  'E a regua para converter qualquer ganho de entrega em dinheiro sem refazer a conta. Multiplique pela diferenca em pontos percentuais que se deseja avaliar, como a da linha 13.',
+  concat('Aplicado ao lift da linha 61, reproduz a ordem de grandeza da linha 63.'),
+  'vt_res_10_conversao_atual'
+FROM vt_res_10_conversao_atual a
+UNION ALL
+SELECT cv.grupo, 'E. Valuation pela conversao, briefings promocionais', 79, 'Receita incremental anualizada, cenario central',
+  round(CAST(cv.receita_incremental * 12.0 / nullif(j.meses_com_registro, 0) AS DOUBLE), 2), 'R$',
+  'Linha 63 levada a doze meses, assumindo que o ritmo de disparos e o efeito do Golden Record do periodo se repetem no resto do ano.',
+  'Receita incremental do periodo dividida pelos meses com registro e multiplicada por doze.',
+  'E o numero para comparar com iniciativas anuais e com o custo de implantacao. E uma projecao simples, sem sazonalidade: se os meses cobertos forem atipicos, a leitura anual herda o desvio.',
+  concat('Fator de ', format_number(12.0 / nullif(j.meses_com_registro, 0), 2), ' sobre ',
+         format_number(j.meses_com_registro, 0), ' meses com registro, de ',
+         CAST(j.primeiro_registro AS STRING), ' a ', CAST(j.ultimo_registro AS STRING), '.'),
+  'vt_res_11_janela'
+FROM vt_res_10_conversao_cenario cv JOIN vt_res_11_janela j ON cv.grupo = j.grupo
+WHERE cv.cenario = 'CALIBRADO_CAMPANHA'
+
+/* ---------------------------------------------------------------- BLOCO F -- */
+UNION ALL
+SELECT f.grupo, 'F. Ativo de cadastro', 80, 'Clientes que nao recebem SMS em nenhum numero',
+  CAST(f.sem_nenhuma_entrega AS DOUBLE), 'CPFs',
+  'Clientes com cobertura do Golden Record para os quais nenhum disparo, em nenhum telefone, foi entregue.',
+  'CPFs cujo maximo de entrega no periodo e zero.',
+  'E a populacao hoje inalcancavel pelo canal. Recuperar parte dela vale mais do que o volume de SMS sugere, porque restabelece um canal de contato inteiro.',
+  concat('Representam ', format_number(100.0 * f.fracao_sem_entrega, 2),
+         ' por cento dos ', format_number(f.clientes_com_gr, 0), ' clientes com cobertura.'),
+  'vt_res_07_cpfs'
+FROM vt_res_07_cpfs f
+UNION ALL
+SELECT f.grupo, 'F. Ativo de cadastro', 81, 'Clientes inalcancaveis com telefone novo disponivel',
+  CAST(f.com_telefone_novo AS DOUBLE), 'CPFs',
+  'Clientes sem nenhuma entrega para os quais o Golden Record aponta um numero que ainda nao foi acionado.',
+  'Subconjunto da linha 80 com insucesso em numero divergente e nenhum disparo previo no telefone recomendado.',
+  'E a oportunidade mais concreta de recuperacao de contato, porque existe um numero nunca testado a disposicao. Deve ser o primeiro publico de um piloto.',
+  concat('Outros ', format_number(f.gr_ja_falhou, 0),
+         ' clientes inalcancaveis ja tiveram o numero recomendado acionado sem sucesso, e para esses o Golden Record nao resolve.'),
+  'vt_res_07_cpfs'
+FROM vt_res_07_cpfs f
+UNION ALL
+SELECT f.grupo, 'F. Ativo de cadastro', 82, 'Clientes com telefone recomendado ja comprovado',
+  CAST(f.gr_comprovado AS DOUBLE), 'CPFs',
+  'Clientes que tiveram insucesso em um numero divergente e entrega comprovada no telefone recomendado.',
+  'CPFs com ao menos um disparo concordante entregue e ao menos um disparo divergente sem entrega.',
+  'E a evidencia mais forte disponivel sem teste controlado, no nivel do cliente: para essas pessoas o numero que falhou nao e o recomendado, e o recomendado ja provou que chega.',
+  'Publico natural para a primeira onda de adocao, porque o risco de troca e proximo de zero.',
+  'vt_res_07_cpfs'
+FROM vt_res_07_cpfs f
+UNION ALL
+SELECT a.grupo, 'F. Ativo de cadastro', 83, 'Valor do contato recuperavel',
+  round(CAST(a.valor_contato_recuperavel AS DOUBLE), 2), 'R$',
+  'Retorno estimado de restabelecer contato com os clientes hoje inalcancaveis que possuem um numero ainda nao acionado.',
+  'Clientes inalcancaveis com telefone novo, multiplicados pela taxa de entrega do telefone recomendado e pelo valor esperado de cada entrega.',
+  'Diferente do restante do bloco de valuation, esta linha monetiza recuperacao de canal, e nao volume de disparo. E o argumento mais estrategico do estudo, porque um cliente sem canal de contato nao responde a nenhuma acao.',
+  concat('Sao ', format_number(a.com_telefone_novo, 0), ' clientes, dos quais cerca de ',
+         format_number(a.contatos_recuperaveis, 0), ' seriam efetivamente alcancados.'),
+  'vt_res_11_ativo_cadastro'
+FROM vt_res_11_ativo_cadastro a
+UNION ALL
+SELECT a.grupo, 'F. Ativo de cadastro', 84, 'Valor do contato ja comprovado',
+  round(CAST(a.valor_contato_comprovado AS DOUBLE), 2), 'R$',
+  'Retorno estimado do grupo em que o telefone recomendado ja demonstrou entregar para aquele mesmo cliente.',
+  'Clientes com entrega comprovada no numero recomendado e insucesso em outro numero, multiplicados pelo valor esperado de cada entrega.',
+  'E o publico de risco zero para a primeira onda de adocao, porque o numero alternativo ja provou funcionar para aquela pessoa. Nao ha premissa envolvida na escolha desse publico.',
+  concat('Sao ', format_number(a.gr_comprovado, 0), ' clientes nessa condicao.'),
+  'vt_res_11_ativo_cadastro'
+FROM vt_res_11_ativo_cadastro a
+UNION ALL
+SELECT e.grupo, 'F. Ativo de cadastro', 85, 'Cadastros que precisariam ser atualizados',
+  CAST(e.cpfs_a_atualizar AS DOUBLE), 'CPFs',
+  'Clientes cujo telefone no CRM difere do recomendado em ao menos um disparo, e que portanto exigiriam atualizacao cadastral.',
+  'Contagem distinta de CPF com ao menos um envio classificado como telefone divergente.',
+  'Dimensiona o esforco de implementacao, que ate aqui o valuation nao considerava. Confronte este volume com a capacidade de carga do CRM para estimar prazo de adocao.',
+  concat('Representam ', format_number(100.0 * e.fracao_a_atualizar, 1),
+         ' por cento dos ', format_number(e.cpfs_com_cobertura, 0), ' clientes com cobertura.'),
+  'vt_res_11_esforco'
+FROM vt_res_11_esforco e
+
+/* ---------------------------------------------------------------- BLOCO G -- */
+UNION ALL
+SELECT q.grupo, 'G. Qualidade e contexto do dado', 90, 'Registros descartados antes do estudo',
+  round(CAST(100.0 * q.fracao_descartada AS DOUBLE), 4), '%',
+  'Fracao dos registros recebidos do CRM que nao entrou no estudo por status contraditorio, status ausente ou chave invalida.',
+  'Registros descartados divididos pelo total de registros recebidos, antes de qualquer filtro de escopo.',
+  'Nao invalida a comparacao, porque o descarte independe de qual telefone foi usado. Reduz a cobertura do estudo e precisa estar visivel para o leitor calibrar a confianca no volume analisado.',
+  concat('Sao ', format_number(q.descartados, 0), ' de ', format_number(q.registros, 0),
+         ' registros, sendo ', format_number(q.status_contraditorio, 0),
+         ' com status contraditorio, ', format_number(q.sem_status, 0),
+         ' sem status e ', format_number(q.chave_invalida, 0), ' com chave invalida.'),
+  'vt_res_11_qualidade'
+FROM vt_res_11_qualidade q
+UNION ALL
+SELECT rt.grupo, 'G. Qualidade e contexto do dado', 91, 'Disparos que sao repeticao',
+  round(CAST(100.0 * rt.fracao_disparos_repetidos AS DOUBLE), 4), '%',
+  'Fracao do volume bruto de disparos que representa nova tentativa para o mesmo cliente, campanha e telefone.',
+  'Disparos brutos menos disparos consolidados, divididos pelo volume bruto.',
+  'Retentativa e custo de midia sem novo alcance. E uma frente de economia independente do Golden Record, e serve de referencia para dimensionar a ordem de grandeza dos ganhos aqui apresentados.',
+  concat('Sao ', format_number(rt.disparos_repetidos, 0), ' disparos repetidos, concentrados em ',
+         format_number(rt.envios_com_retentativa, 0), ' combinacoes de cliente, campanha e telefone.'),
+  'vt_res_11_retentativa'
+FROM vt_res_11_retentativa rt
+UNION ALL
+SELECT sc.grupo, 'G. Qualidade e contexto do dado', 92, 'Vantagem da carga recente sobre a carga antiga',
+  round(CAST(100.0 * sc.diferenca AS DOUBLE), 4), 'p.p.',
+  'Diferenca de entrega do telefone recomendado entre registros da carga mais recente e registros com mais de doze meses.',
+  'Taxa de entrega do braco concordante para registros ingeridos ha ate tres meses menos a mesma taxa para registros com mais de doze meses.',
+  'Indica se a atualizacao do cadastro tem valor proprio, alem da escolha do numero. Valor positivo relevante justifica aumentar a frequencia de reprocessamento do Golden Record. Ressalva: sem data de envio na base de campanhas, a idade e medida em relacao a carga mais recente, e nao ao momento do disparo.',
+  concat('Carga recente entrega ', format_number(100.0 * sc.taxa_recente, 2),
+         ' por cento sobre ', format_number(sc.envios_recente, 0), ' disparos, contra ',
+         format_number(100.0 * sc.taxa_antiga, 2), ' por cento sobre ',
+         format_number(sc.envios_antiga, 0), ' disparos da carga antiga.'),
+  'vt_res_11_safra_contraste'
+FROM vt_res_11_safra_contraste sc
+UNION ALL
+SELECT j.grupo, 'G. Qualidade e contexto do dado', 93, 'Janela coberta pelo estudo',
+  CAST(j.dias_cobertos AS DOUBLE), 'dias',
+  'Intervalo entre o primeiro e o ultimo registro de disparo dentro do escopo.',
+  'Diferenca em dias entre a data minima e a data maxima de registro, mais um.',
+  'Define a unidade de tempo de todo o bloco de valuation. Os valores de receita e de custo dos blocos D e E sao do periodo coberto; a linha 79 os anualiza dividindo por meses com registro e multiplicando por doze.',
+  concat('De ', CAST(j.primeiro_registro AS STRING), ' a ', CAST(j.ultimo_registro AS STRING),
+         ', com registro em ', format_number(j.meses_com_registro, 0), ' meses distintos.'),
+  'vt_res_11_janela'
+FROM vt_res_11_janela j
+UNION ALL
+SELECT v.grupo, 'G. Qualidade e contexto do dado', 94, 'Disparos em que a recomendacao ja existia',
+  round(CAST(100.0 * v.fracao_anteriores AS DOUBLE), 4), '%',
+  'Fracao dos disparos cujo registro do Golden Record foi ingerido em data anterior ou igual a do proprio disparo.',
+  'Comparacao entre a data de ingestao do registro do Golden Record e a data do registro de disparo.',
+  'Afirmar que o Golden Record teria recomendado outro telefone so faz sentido se a recomendacao existisse na epoca. Esta linha mede quanto do estudo atende a essa condicao. Percentual alto elimina a principal ressalva temporal do desenho.',
+  concat('Em ', format_number(v.posteriores, 0), ' disparos a recomendacao e posterior ao envio, e em ',
+         format_number(v.indeterminadas, 0), ' a data nao pode ser determinada.'),
+  'vt_res_11_validade_temporal'
+FROM vt_res_11_validade_temporal v
+UNION ALL
+SELECT e.grupo, 'G. Qualidade e contexto do dado', 95, 'Efeito restrito aos disparos temporalmente validos',
+  round(CAST(100.0 * e.diferenca AS DOUBLE), 4), 'p.p.',
+  'Diferenca de entrega entre os dois bracos, considerando apenas os disparos em que a recomendacao ja existia.',
+  'Mesma conta da diferenca bruta, restrita aos envios cuja data de ingestao do Golden Record antecede a do disparo.',
+  'E o teste de sensibilidade da ressalva temporal. Valor proximo ao da diferenca bruta indica que o resultado nao depende de recomendacoes criadas depois das campanhas, e a ameaca deixa de ser relevante.',
+  concat('Calculado sobre ', format_number(e.n1 + e.n0, 0), ' disparos temporalmente validos.'),
+  'vt_res_11_efeito_temporalmente_valido'
+FROM vt_res_11_efeito_temporalmente_valido e
+
+/* ---------------------------------------------------------------- BLOCO H -- */
+UNION ALL
+SELECT t.grupo, 'H. Evolucao ao longo dos meses', 100, 'Meses com disparo no escopo',
+  CAST(t.meses AS DOUBLE), 'meses',
+  'Quantidade de meses distintos com registro de disparo dentro da janela do estudo.',
+  'Contagem de meses distintos na serie mensal, considerando apenas meses em que os dois bracos existem.',
+  'Define a robustez de toda a leitura temporal deste bloco. Com poucos meses, tendencia e ruido se confundem e as inclinacoes devem ser lidas como indicio, nao como conclusao.',
+  concat('Serie disponivel para consulta detalhada na view vt_res_11_mensal_calc, com um registro por mes.'),
+  'vt_res_11_tendencia'
+FROM vt_res_11_tendencia t
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 101, 'Variacao da entrega SEM o telefone recomendado',
+  round(CAST(100.0 * pu.variacao_sem_recomendado AS DOUBLE), 4), 'p.p.',
+  'Diferenca na taxa de entrega do braco divergente entre o ultimo e o primeiro mes da janela.',
+  'Taxa de entrega dos disparos que nao usaram o telefone recomendado, no ultimo mes, menos a mesma taxa no primeiro mes.',
+  'Este e o indicador que responde se a operacao esta melhorando por conta propria, sem o cadastro. Valor positivo significa que a entrega subiu por outra causa, como higienizacao de base, mudanca de fornecedor ou perfil de campanha. Nesse caso, o ganho atribuivel ao Golden Record deve ser lido contra esse pano de fundo, e nao como se toda a melhora viesse dele.',
+  concat('De ', format_number(100.0 * pu.sem_recomendado_inicio, 2), ' por cento em ', pu.primeiro_mes,
+         ' para ', format_number(100.0 * pu.sem_recomendado_fim, 2), ' por cento em ', pu.ultimo_mes, '.'),
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 102, 'Variacao da entrega COM o telefone recomendado',
+  round(CAST(100.0 * pu.variacao_com_recomendado AS DOUBLE), 4), 'p.p.',
+  'Diferenca na taxa de entrega do braco concordante entre o ultimo e o primeiro mes da janela.',
+  'Taxa de entrega dos disparos que coincidiram com o telefone recomendado, no ultimo mes, menos a mesma taxa no primeiro mes.',
+  'Compare com a linha anterior. Se as duas subirem juntas, a melhora e da operacao e nao do cadastro. Se apenas esta subir, o cadastro esta ganhando qualidade. Se esta cair enquanto a outra sobe, o cadastro esta envelhecendo.',
+  concat('De ', format_number(100.0 * pu.com_recomendado_inicio, 2), ' por cento em ', pu.primeiro_mes,
+         ' para ', format_number(100.0 * pu.com_recomendado_fim, 2), ' por cento em ', pu.ultimo_mes, '.'),
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 103, 'Vantagem do Golden Record no primeiro mes',
+  round(CAST(100.0 * pu.vantagem_inicio AS DOUBLE), 4), 'p.p.',
+  'Diferenca entre os dois bracos no mes mais antigo da janela.',
+  'Taxa do braco concordante menos taxa do braco divergente, dentro do primeiro mes.',
+  'E o ponto de partida da serie. Serve de referencia para julgar se a vantagem se manteve ao longo do periodo.',
+  concat('Mes de referencia: ', pu.primeiro_mes, ', com ', format_number(pu.disparos_inicio, 0), ' disparos.'),
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 104, 'Vantagem do Golden Record no ultimo mes',
+  round(CAST(100.0 * pu.vantagem_fim AS DOUBLE), 4), 'p.p.',
+  'Diferenca entre os dois bracos no mes mais recente da janela.',
+  'Taxa do braco concordante menos taxa do braco divergente, dentro do ultimo mes.',
+  'E a leitura mais atual do efeito, e a que melhor representa o que se pode esperar de uma adocao a partir de agora. Se estiver proxima da linha 103, o cadastro esta estavel.',
+  concat('Mes de referencia: ', pu.ultimo_mes, ', com ', format_number(pu.disparos_fim, 0), ' disparos.'),
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 105, 'Variacao da vantagem entre o primeiro e o ultimo mes',
+  round(CAST(100.0 * pu.variacao_vantagem AS DOUBLE), 4), 'p.p.',
+  'Quanto a vantagem do telefone recomendado cresceu ou encolheu ao longo da janela.',
+  'Vantagem no ultimo mes menos vantagem no primeiro mes.',
+  'Valor negativo indica cadastro perdendo poder de discriminacao, o que justifica aumentar a frequencia de carga. Valor positivo indica que as cargas recentes estao acrescentando informacao. Valor proximo de zero indica estabilidade, que e o cenario mais confortavel para projetar o valuation para frente.',
+  'Leia junto com a linha 106, que usa todos os meses em vez de apenas as duas pontas e por isso e menos sensivel a um mes atipico.',
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+UNION ALL
+SELECT t.grupo, 'H. Evolucao ao longo dos meses', 106, 'Tendencia mensal da vantagem',
+  round(CAST(100.0 * t.inclinacao_vantagem AS DOUBLE), 4), 'p.p. por mes',
+  'Inclinacao da reta ajustada a serie mensal da vantagem do telefone recomendado.',
+  'Minimos quadrados sobre os valores mensais da diferenca entre os dois bracos, com o mes como variavel independente.',
+  'E a leitura de tendencia mais confiavel do bloco, porque usa todos os meses e nao apenas as pontas. Multiplicada por doze, estima quanto a vantagem mudaria em um ano mantido o ritmo atual. Sinal negativo relevante e o gatilho para revisar a periodicidade de atualizacao do cadastro.',
+  concat('Mantido o ritmo, a vantagem mudaria ',
+         format_number(100.0 * t.inclinacao_vantagem * 12, 2), ' pontos percentuais em doze meses.'),
+  'vt_res_11_tendencia'
+FROM vt_res_11_tendencia t
+UNION ALL
+SELECT t.grupo, 'H. Evolucao ao longo dos meses', 107, 'Tendencia mensal da entrega sem o telefone recomendado',
+  round(CAST(100.0 * t.inclinacao_sem_recomendado AS DOUBLE), 4), 'p.p. por mes',
+  'Inclinacao da reta ajustada a serie mensal da taxa de entrega do braco divergente.',
+  'Minimos quadrados sobre os valores mensais da taxa de entrega dos disparos que nao usaram o telefone recomendado.',
+  'E a tendencia da operacao sem o cadastro, ou seja, a linha de base contra a qual o Golden Record deve ser julgado. Se ela for positiva e relevante, parte da melhora observada no periodo nao pode ser creditada ao cadastro, e o valuation deve ser apresentado com essa ressalva.',
+  concat('Em ', format_number(t.meses, 0), ' meses avaliados, o Golden Record ficou a frente em ',
+         format_number(t.meses_com_ganho, 0), ' deles.'),
+  'vt_res_11_tendencia'
+FROM vt_res_11_tendencia t
+UNION ALL
+SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 108, 'Variacao da cobertura do Golden Record',
+  round(CAST(100.0 * pu.variacao_cobertura AS DOUBLE), 4), 'p.p.',
+  'Diferenca na fracao de disparos com telefone cadastrado, entre o ultimo e o primeiro mes.',
+  'Cobertura do Golden Record no ultimo mes menos cobertura no primeiro mes.',
+  'Cobertura crescente amplia o alcance da iniciativa ao longo do tempo e favorece projetar o valuation para frente. Cobertura decrescente indica que a base de clientes acionados esta se afastando do cadastro, e o valor estimado tende a encolher.',
+  concat('De ', format_number(100.0 * pu.cobertura_inicio, 2), ' por cento em ', pu.primeiro_mes,
+         ' para ', format_number(100.0 * pu.cobertura_fim, 2), ' por cento em ', pu.ultimo_mes, '.'),
+  'vt_res_11_primeiro_ultimo'
+FROM vt_res_11_primeiro_ultimo pu
+;
+
+
+/* -----------------------------------------------------------------------------
+   12.1  CONTEXTO PARA LEITURA DOS PERCENTUAIS
+
+   Nem todo percentual do resumo tem o mesmo denominador, e ler as linhas em
+   sequência induz a erro. Três indicadores do bloco A deixam o problema claro:
+
+     cobertura sobre disparos            incide sobre todos os disparos
+     disparos com telefone divergente    incide sobre os disparos com cobertura
+     insucessos com telefone divergente  incide sobre os insucessos com cobertura
+
+   Cada um é uma fração de uma base menor que a anterior. A saída resolve isso
+   com cinco colunas de contexto:
+
+     base_de_calculo         nomeia o denominador em palavras
+     quantidade              numerador absoluto do indicador
+     quantidade_base         denominador absoluto, o tamanho da etapa anterior
+     pct_da_etapa_anterior   quantidade dividida por quantidade_base
+     pct_do_total            quantidade dividida pela etapa original, que é o
+                             total de disparos analisados
+
+   O bloco E usa as mesmas colunas para contar sua história como funil, com
+   os denominadores restritos aos briefings promocionais: entregas atuais
+   sobre disparos promocionais, candidatos sobre insucessos promocionais,
+   recuperadas sobre candidatos, entregas em risco sobre entregas atuais,
+   perdidas sobre entregas em risco, e o saldo líquido sobre os disparos
+   promocionais com cobertura. As linhas 45 a 47 do bloco D fazem a ponte
+   entre os dois escopos.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_12_contexto AS
+SELECT
+  v.grupo,
+  v.disparos                  AS total_disparos,
+  v.clientes                  AS total_clientes,
+  v.entregas                  AS total_entregas,
+  v.insucessos                AS total_insucessos,
+  v.disparos_com_gr           AS disparos_com_cobertura,
+  v.clientes_com_gr           AS clientes_com_cobertura,
+  d.envios                    AS disparos_divergentes,
+  a.gr_diferente              AS candidatos_recuperacao,
+  a.gr_diferente + a.gr_igual AS insucessos_com_cobertura,
+  s.recuperadas               AS entregas_recuperadas,
+  s.em_risco                  AS entregas_em_risco,
+  s.perdidas                  AS entregas_perdidas,
+  s.entregas_liquidas         AS entregas_liquidas,
+  pt.briefings_total          AS briefings_total,
+  pt.briefings_promo          AS briefings_promo,
+  pt.disparos_transacional    AS disparos_transacional,
+  pt.liquidas_transacional    AS liquidas_transacional,
+  pt.disparos_promo           AS disparos_promo,
+  pt.disparos_com_gr_promo    AS disparos_com_cobertura_promo,
+  pt.entregas_promo           AS entregas_promo,
+  pt.insucessos_promo         AS insucessos_promo,
+  sp.candidatos               AS candidatos_promo,
+  sp.recuperadas              AS recuperadas_promo,
+  sp.em_risco                 AS em_risco_promo,
+  sp.perdidas                 AS perdidas_promo,
+  sp.entregas_liquidas        AS liquidas_promo
+FROM vt_res_04_volume v
+LEFT JOIN (
+  SELECT grupo, envios FROM vt_res_04_concordancia WHERE classe_concordancia = 'DIFERENTE'
+) d ON v.grupo = d.grupo
+LEFT JOIN vt_res_04_anatomia_insucesso a ON v.grupo = a.grupo
+LEFT JOIN (
+  SELECT grupo, recuperadas, em_risco, perdidas, entregas_liquidas
+  FROM vt_res_07_saldo WHERE cenario = 'CALIBRADO_CAMPANHA'
+) s ON v.grupo = s.grupo
+LEFT JOIN vt_res_10_ponte pt ON v.grupo = pt.grupo
+LEFT JOIN (
+  SELECT grupo, candidatos, recuperadas, em_risco, perdidas, entregas_liquidas
+  FROM vt_res_09_segmento WHERE segmento = 'PROMOCIONAL'
+) sp ON v.grupo = sp.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   12.2  SAÍDA DO ESTUDO 1
+----------------------------------------------------------------------------- */
+WITH contexto AS (
+  SELECT
+    r.grupo,
+    r.bloco,
+    r.ordem,
+    r.indicador,
+    r.valor,
+    r.unidade,
+    CASE r.ordem
+      WHEN   4 THEN 'todos os disparos do escopo'
+      WHEN   5 THEN 'todos os disparos do escopo'
+      WHEN   6 THEN 'todos os clientes do escopo'
+      WHEN   7 THEN 'apenas os disparos com cobertura do Golden Record'
+      WHEN   8 THEN 'apenas os insucessos com cobertura do Golden Record'
+      WHEN   9 THEN 'todos os disparos do escopo'
+      WHEN  10 THEN 'disparos do braco concordante'
+      WHEN  11 THEN 'disparos do braco divergente'
+      WHEN  12 THEN 'diferenca entre os dois bracos, sem controle'
+      WHEN  13 THEN 'diferenca entre os dois bracos, ponderada dentro de cada campanha'
+      WHEN  14 THEN 'razao de chances entre os dois bracos'
+      WHEN  15 THEN 'clientes com disparo nos dois bracos'
+      WHEN  16 THEN 'pares de disparo do mesmo cliente na mesma campanha'
+      WHEN  17 THEN 'disparos no numero mais acionado que difere do recomendado'
+      WHEN  18 THEN 'diferenca entre o telefone recomendado e a regra simples'
+      WHEN  19 THEN 'campanhas com volume minimo nos dois bracos, uma observacao cada'
+      WHEN  20 THEN 'campanhas com volume minimo nos dois bracos'
+      WHEN  21 THEN 'diferenca entre os dois bracos, excluida a maior campanha'
+      WHEN  22 THEN 'diferenca entre os dois bracos, com regra estrita de comparacao'
+      WHEN  23 THEN 'diferenca entre disparos com e sem cobertura'
+      WHEN  24 THEN 'faixa de porte de campanha com menor efeito'
+      WHEN  25 THEN 'faixa de porte de campanha com maior efeito'
+      WHEN  26 THEN 'faixa de intensidade de contato com menor efeito'
+      WHEN  27 THEN 'faixa de intensidade de contato com maior efeito'
+      WHEN  28 THEN 'codigos de area com pelo menos mil disparos em cada braco'
+      WHEN  30 THEN 'todos os disparos do escopo'
+      WHEN  31 THEN 'apenas os disparos sem entrega'
+      WHEN  32 THEN 'entregas do escopo'
+      WHEN  33 THEN 'entregas do braco concordante'
+      WHEN  34 THEN 'entregas do braco divergente'
+      WHEN  35 THEN 'diferenca de custo entre os dois bracos'
+      WHEN  42 THEN 'entregas do escopo, antes e depois da adocao'
+      WHEN  43 THEN 'campanhas com ganho positivo no cenario central'
+      WHEN  44 THEN 'entregas recuperadas de todas as campanhas'
+      WHEN  45 THEN 'todos os disparos do escopo'
+      WHEN  46 THEN 'entregas liquidas do cenario central, todas as campanhas'
+      WHEN  47 THEN 'entregas liquidas do cenario central, todas as campanhas'
+      WHEN  48 THEN 'apenas os disparos transacionais sem entrega'
+      WHEN  49 THEN 'entregas liquidas transacionais do cenario central'
+      WHEN  50 THEN 'todos os briefings com disparo na janela'
+      WHEN  51 THEN 'todos os disparos dos briefings promocionais'
+      WHEN  52 THEN 'entregas atuais promocionais, convertidas pela taxa de cada briefing'
+      WHEN  53 THEN 'conversoes atuais, convertidas pelo ticket de cada briefing'
+      WHEN  54 THEN 'entregas atuais promocionais, media ponderada das taxas dos briefings'
+      WHEN  55 THEN 'conversoes atuais, media ponderada dos tickets dos briefings'
+      WHEN  56 THEN 'apenas os insucessos dos briefings promocionais'
+      WHEN  57 THEN 'apenas os candidatos a recuperacao dos briefings promocionais'
+      WHEN  58 THEN 'apenas as entregas atuais dos briefings promocionais'
+      WHEN  59 THEN 'apenas as entregas em risco dos briefings promocionais'
+      WHEN  60 THEN 'disparos promocionais com cobertura do Golden Record'
+      WHEN  61 THEN 'disparos promocionais com cobertura do Golden Record'
+      WHEN  62 THEN 'entregas liquidas promocionais, convertidas pela taxa de cada briefing'
+      WHEN  63 THEN 'conversoes incrementais, convertidas pelo ticket de cada briefing'
+      WHEN  64 THEN 'receita atual dos briefings promocionais'
+      WHEN  65 THEN 'contagem absoluta, sem denominador'
+      WHEN  66 THEN 'briefings promocionais com saldo positivo no cenario central'
+      WHEN  72 THEN 'apenas os candidatos promocionais com historico do telefone recomendado'
+      WHEN  73 THEN 'todos os candidatos a recuperacao dos briefings promocionais'
+      WHEN  74 THEN 'receita incremental do cenario central'
+      WHEN  75 THEN 'receita incremental do cenario central'
+      WHEN  76 THEN 'cenario calibrado global promocional, taxa do telefone recomendado no limite inferior de 95 por cento'
+      WHEN  77 THEN 'cenario calibrado global promocional, taxa do telefone recomendado no limite superior de 95 por cento'
+      WHEN  78 THEN 'um centesimo dos disparos com cobertura de cada briefing promocional'
+      WHEN  79 THEN 'receita incremental do periodo, dividida pelos meses com registro e vezes doze'
+      WHEN  80 THEN 'clientes com cobertura do Golden Record'
+      WHEN  81 THEN 'clientes com cobertura do Golden Record'
+      WHEN  82 THEN 'clientes com cobertura do Golden Record'
+      WHEN  83 THEN 'clientes inalcancaveis com telefone ainda nao acionado'
+      WHEN  84 THEN 'clientes com entrega comprovada no telefone recomendado'
+      WHEN  85 THEN 'clientes com cobertura do Golden Record'
+      WHEN  90 THEN 'todos os registros recebidos do CRM, antes do filtro de escopo'
+      WHEN  91 THEN 'volume bruto de disparos, antes da consolidacao de retentativas'
+      WHEN  92 THEN 'diferenca entre a carga recente e a carga com mais de doze meses'
+      WHEN  93 THEN 'contagem absoluta, sem denominador'
+      WHEN  94 THEN 'todos os disparos com cobertura do Golden Record'
+      WHEN  95 THEN 'diferenca entre os dois bracos, restrita aos disparos validos no tempo'
+      WHEN 100 THEN 'contagem absoluta, sem denominador'
+      WHEN 101 THEN 'disparos do braco divergente, comparando o ultimo mes com o primeiro'
+      WHEN 102 THEN 'disparos do braco concordante, comparando o ultimo mes com o primeiro'
+      WHEN 103 THEN 'diferenca entre os dois bracos, dentro do primeiro mes'
+      WHEN 104 THEN 'diferenca entre os dois bracos, dentro do ultimo mes'
+      WHEN 105 THEN 'diferenca entre a vantagem do ultimo mes e a do primeiro'
+      WHEN 106 THEN 'serie mensal da vantagem, reta ajustada por minimos quadrados'
+      WHEN 107 THEN 'serie mensal da entrega sem o telefone recomendado, reta ajustada'
+      WHEN 108 THEN 'todos os disparos, comparando o ultimo mes com o primeiro'
+      ELSE CASE
+        WHEN r.ordem BETWEEN 37 AND 41 THEN 'entregas liquidas do cenario'
+        WHEN r.ordem BETWEEN 67 AND 71 THEN 'entregas liquidas do cenario, somadas sobre os briefings promocionais'
+        ELSE 'contagem absoluta, sem denominador'
+      END
+    END                                                      AS base_de_calculo,
+    CASE r.ordem
+      WHEN  4 THEN CAST(c.total_entregas AS DOUBLE)
+      WHEN  5 THEN CAST(c.disparos_com_cobertura AS DOUBLE)
+      WHEN  6 THEN CAST(c.clientes_com_cobertura AS DOUBLE)
+      WHEN  7 THEN CAST(c.disparos_divergentes AS DOUBLE)
+      WHEN  8 THEN CAST(c.candidatos_recuperacao AS DOUBLE)
+      WHEN  9 THEN CAST(c.total_insucessos AS DOUBLE)
+      WHEN 45 THEN CAST(c.disparos_transacional AS DOUBLE)
+      WHEN 46 THEN CAST(c.liquidas_transacional AS DOUBLE)
+      WHEN 47 THEN CAST(c.liquidas_promo AS DOUBLE)
+      WHEN 50 THEN CAST(c.briefings_promo AS DOUBLE)
+      WHEN 51 THEN CAST(c.entregas_promo AS DOUBLE)
+      WHEN 56 THEN CAST(c.candidatos_promo AS DOUBLE)
+      WHEN 57 THEN CAST(c.recuperadas_promo AS DOUBLE)
+      WHEN 58 THEN CAST(c.em_risco_promo AS DOUBLE)
+      WHEN 59 THEN CAST(c.perdidas_promo AS DOUBLE)
+      WHEN 60 THEN CAST(c.liquidas_promo AS DOUBLE)
+      ELSE NULL
+    END                                                      AS quantidade,
+    CASE r.ordem
+      WHEN  4 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  5 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  6 THEN CAST(c.total_clientes AS DOUBLE)
+      WHEN  7 THEN CAST(c.disparos_com_cobertura AS DOUBLE)
+      WHEN  8 THEN CAST(c.insucessos_com_cobertura AS DOUBLE)
+      WHEN  9 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 45 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 46 THEN CAST(c.entregas_liquidas AS DOUBLE)
+      WHEN 47 THEN CAST(c.entregas_liquidas AS DOUBLE)
+      WHEN 50 THEN CAST(c.briefings_total AS DOUBLE)
+      WHEN 51 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 56 THEN CAST(c.insucessos_promo AS DOUBLE)
+      WHEN 57 THEN CAST(c.candidatos_promo AS DOUBLE)
+      WHEN 58 THEN CAST(c.entregas_promo AS DOUBLE)
+      WHEN 59 THEN CAST(c.em_risco_promo AS DOUBLE)
+      WHEN 60 THEN CAST(c.disparos_com_cobertura_promo AS DOUBLE)
+      ELSE NULL
+    END                                                      AS quantidade_base,
+    CASE r.ordem
+      WHEN  6 THEN CAST(c.total_clientes AS DOUBLE)
+      WHEN  4 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  5 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  7 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  8 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN  9 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 45 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 46 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 47 THEN CAST(c.total_disparos AS DOUBLE)
+      WHEN 50 THEN CAST(c.briefings_total AS DOUBLE)
+      WHEN 51 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 56 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 57 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 58 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 59 THEN CAST(c.disparos_promo AS DOUBLE)
+      WHEN 60 THEN CAST(c.disparos_promo AS DOUBLE)
+      ELSE NULL
+    END                                                      AS etapa_original,
+    r.definicao,
+    r.calculo,
+    r.interpretacao,
+    r.exemplo,
+    r.origem
+  FROM vt_res_12_resumo r
+  JOIN vt_res_12_contexto c ON r.grupo = c.grupo
+)
+SELECT
+  grupo,
+  bloco,
+  ordem,
+  indicador,
+  valor,
+  unidade,
+  base_de_calculo,
+  quantidade,
+  quantidade_base,
+  round(CAST(100.0 * quantidade / nullif(quantidade_base, 0) AS DOUBLE), 4) AS pct_da_etapa_anterior,
+  round(CAST(100.0 * quantidade / nullif(etapa_original, 0)  AS DOUBLE), 4) AS pct_do_total,
+  definicao,
+  calculo,
+  interpretacao,
+  exemplo,
+  origem
+FROM contexto
+ORDER BY grupo, ordem
+;
