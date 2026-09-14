@@ -124,10 +124,15 @@ SELECT
    própria linha no resumo executivo, e o rótulo TOTAL consolida o conjunto.
 
    REGRA DE ESCOPO
-     Com ao menos um grupo preenchido, a análise roda apenas sobre as campanhas
-     informadas, e TOTAL é a união delas.
-     Com os três grupos vazios, a análise roda sobre a base completa sob o
-     rótulo TOTAL. Essa é a configuração padrão.
+     O universo do estudo é sempre o conjunto de briefings da seção 00.5, que
+     são os que têm economia de conversão informada. Briefings fora dessa
+     tabela não entram em nenhuma análise.
+     Os três grupos abaixo são recortes opcionais dentro desse universo. Com ao
+     menos um grupo preenchido, cada grupo vira uma linha nos resultados e
+     TOTAL é a união deles. Com os três grupos vazios, o estudo roda sobre
+     todos os briefings da seção 00.5 sob o rótulo TOTAL, que é o padrão.
+     Um identificador listado em um grupo mas ausente da seção 00.5 é
+     ignorado.
 
    COMO INFORMAR
    O recorte é feito pelo identificador de briefing, e não pelo nome da
@@ -201,6 +206,11 @@ CROSS JOIN (
    eles, o estudo calcula quantas entregas o Golden Record recupera em cada
    briefing, converte em conversões pela taxa daquele briefing e em receita pelo
    tíquete daquele briefing.
+
+   ESTA TABELA DEFINE O ESCOPO DO ESTUDO
+   Apenas os briefings listados aqui entram na análise. Todo o restante da
+   base de disparos é ignorado, em todas as seções. Para ampliar o estudo,
+   acrescente briefings a esta tabela. Para restringir, remova.
 
    COLUNAS
      id_briefing            identificador do briefing, o mesmo da base de
@@ -709,16 +719,23 @@ FROM vt_param_grupos
 ;
 
 CREATE OR REPLACE TEMP VIEW vt_grupo_briefing AS
-WITH definido AS (
-  SELECT grupo, explode(id_briefings) AS id_briefing
-  FROM vt_grupo_lista
-  WHERE id_briefings IS NOT NULL AND size(id_briefings) > 0
+WITH parametrizados AS (
+  SELECT DISTINCT id_briefing FROM vt_param_briefing
+),
+definido AS (
+  SELECT l.grupo, l.id_briefing
+  FROM (
+    SELECT grupo, explode(id_briefings) AS id_briefing
+    FROM vt_grupo_lista
+    WHERE id_briefings IS NOT NULL AND size(id_briefings) > 0
+  ) l
+  JOIN parametrizados p ON l.id_briefing = p.id_briefing
 ),
 contagem AS (
   SELECT count(*) AS listadas FROM definido
 ),
 universo AS (
-  SELECT DISTINCT id_briefing FROM tb_crm_envio_analitico
+  SELECT id_briefing FROM parametrizados
 ),
 total_sem_lista AS (
   SELECT 'TOTAL' AS grupo, u.id_briefing
@@ -1450,44 +1467,248 @@ JOIN vt_res_09_custo_atual c ON s.grupo = c.grupo
    Segunda lente financeira. Assume que uma fração das entregas gera a conversão
    de interesse e que cada conversão tem um retorno médio.
 
+   A CONTA É FEITA BRIEFING A BRIEFING E DEPOIS SOMADA
+   Cada briefing do escopo tem taxa de conversão e tíquete próprios, informados
+   na seção 00.5. As entregas que o Golden Record recupera em cada briefing são
+   convertidas pela taxa daquele briefing e pelo tíquete daquele briefing, e só
+   então os briefings são somados. Nenhuma premissa única é aplicada ao total.
+
+   Os cinco cenários da seção 07 são recalculados dentro de cada briefing com
+   os mesmos ingredientes, o que garante que a soma dos briefings reconcilie
+   com o total para quatro deles. O cenário de evidência extrapolada usa a taxa
+   histórica do próprio briefing quando existe, e pode diferir ligeiramente.
+
+   As views vt_res_10_conversao_atual, vt_res_10_conversao_cenario e
+   vt_res_10_sensibilidade expõem os mesmos campos de antes, agora alimentados
+   pela soma dos briefings. Onde havia uma taxa única, passa a existir a taxa
+   efetiva, que é a média das taxas dos briefings ponderada pelas entregas.
+
    ESTA LENTE NÃO SE SOMA À ANTERIOR
    As duas medem o mesmo conjunto de entregas adicionais, por réguas
    diferentes. A lente de custo diz quanto valeria comprar essas entregas em
    mídia. A lente de conversão diz quanto elas geram de receita. Somar as duas
-   contaria o mesmo ganho duas vezes. A leitura correta é tratar a lente de
-   custo como piso e a de conversão como valor de negócio.
+   contaria o mesmo ganho duas vezes.
    ============================================================================= */
 
-CREATE OR REPLACE TEMP VIEW vt_res_10_conversao_atual AS
+
+/* -----------------------------------------------------------------------------
+   10.1  VOLUME E ECONOMIA POR BRIEFING
+
+   Um briefing pode reunir mais de uma campanha. O volume é somado sobre as
+   campanhas do briefing, e a economia vem da seção 00.5 com a regra de reserva
+   declarada em origem_taxa e origem_ticket.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_briefing_volume AS
+SELECT
+  grupo,
+  id_briefing,
+  count(*)                                        AS n_envios,
+  sum(entregue)                                   AS n_entregues,
+  sum(CASE WHEN tem_gr THEN 1 ELSE 0 END)         AS n_com_gr,
+  count(DISTINCT campanha)                        AS n_campanhas
+FROM vt_base_grupo
+GROUP BY grupo, id_briefing
+;
+
+CREATE OR REPLACE TEMP VIEW vt_briefing_economia AS
 SELECT
   v.grupo,
-  gp.taxa_conversao,
-  gp.valor_conversao,
-  gp.taxa_conversao * gp.valor_conversao                       AS valor_por_entrega,
-  v.entregas * gp.taxa_conversao                               AS conversoes_hoje,
-  v.entregas * gp.taxa_conversao * gp.valor_conversao          AS receita_hoje,
-  v.entregas * gp.taxa_conversao * gp.valor_conversao
-    / nullif(c.custo_total, 0)                                 AS retorno_por_real,
-  v.disparos_com_gr / 100.0
-    * gp.taxa_conversao * gp.valor_conversao                   AS valor_por_ponto_percentual
-FROM vt_res_04_volume v
-JOIN vt_grupo_param gp        ON v.grupo = gp.grupo
-JOIN vt_res_09_custo_atual c  ON v.grupo = c.grupo
+  v.id_briefing,
+  v.n_campanhas,
+  v.n_envios,
+  v.n_entregues,
+  v.n_com_gr,
+  v.n_envios - v.n_entregues                             AS n_insucessos,
+  coalesce(p.conversao_pct / 100.0,
+           p.conversoes_observadas / nullif(v.n_entregues, 0),
+           gp.taxa_conversao)                            AS taxa_conversao,
+  coalesce(p.ticket_medio, gp.valor_conversao)           AS ticket_medio,
+  CASE WHEN p.conversao_pct IS NOT NULL          THEN 'INFORMADA'
+       WHEN p.conversoes_observadas IS NOT NULL  THEN 'DERIVADA_DAS_CONVERSOES'
+       ELSE                                           'RESERVA_DO_GRUPO' END AS origem_taxa,
+  CASE WHEN p.ticket_medio IS NOT NULL THEN 'INFORMADO'
+       ELSE 'RESERVA_DO_GRUPO' END                      AS origem_ticket,
+  gp.custo_sms
+FROM vt_briefing_volume v
+LEFT JOIN vt_param_briefing p ON v.id_briefing = p.id_briefing
+JOIN vt_grupo_param gp          ON v.grupo = gp.grupo
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.2  CENÁRIOS POR BRIEFING
+
+   Mesma lógica da seção 07, aplicada dentro de cada briefing.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_briefing_cenarios AS
+WITH base AS (
+  SELECT
+    d.grupo,
+    d.id_briefing,
+    sum(CASE WHEN d.entregue = 0 THEN 1 ELSE 0 END)                                AS candidatos,
+    sum(CASE WHEN d.entregue = 0 THEN d.taxa_calibracao_campanha ELSE 0 END)       AS recup_calibrada,
+    max(d.taxa_concordante_global)                                                 AS taxa_global,
+    avg(CASE WHEN d.entregue = 0 AND d.evidencia_direta <> 'GR_NUNCA_ACIONADO'
+             THEN d.gr_taxa_entrega END)                                           AS taxa_hist_briefing,
+    sum(CASE WHEN d.entregue = 0 AND d.evidencia_direta = 'GR_ACIONADO_E_ENTREGOU'
+             THEN 1 ELSE 0 END)                                                    AS provada,
+    sum(CASE WHEN d.entregue = 1 THEN 1 ELSE 0 END)                                AS em_risco,
+    sum(CASE WHEN d.entregue = 1 THEN 1 - d.taxa_calibracao_campanha ELSE 0 END)   AS perda_calibrada,
+    sum(CASE WHEN d.entregue = 1 AND d.evidencia_direta = 'GR_ACIONADO_SEM_ENTREGA'
+             THEN 1 ELSE 0 END)                                                    AS perda_provada
+  FROM vt_envios_gr_diferente d
+  GROUP BY d.grupo, d.id_briefing
+),
+com_reserva AS (
+  SELECT b.*, coalesce(b.taxa_hist_briefing, ev.taxa_historica) AS taxa_hist
+  FROM base b
+  LEFT JOIN vt_res_07_evidencia ev ON b.grupo = ev.grupo
+)
+SELECT grupo, id_briefing, 1 AS ordem, 'TETO' AS cenario,
+       CAST(candidatos AS DOUBLE) AS recuperadas, CAST(0.0 AS DOUBLE) AS perdidas
+FROM com_reserva
+UNION ALL
+SELECT grupo, id_briefing, 2, 'CALIBRADO_GLOBAL',
+       candidatos * taxa_global, em_risco * (1 - taxa_global)
+FROM com_reserva
+UNION ALL
+SELECT grupo, id_briefing, 3, 'CALIBRADO_CAMPANHA',
+       recup_calibrada, perda_calibrada
+FROM com_reserva
+UNION ALL
+SELECT grupo, id_briefing, 4, 'EVIDENCIA_EXTRAPOLADA',
+       candidatos * taxa_hist, em_risco * (1 - taxa_hist)
+FROM com_reserva
+UNION ALL
+SELECT grupo, id_briefing, 5, 'PISO_OBSERVADO',
+       CAST(provada AS DOUBLE), CAST(perda_provada AS DOUBLE)
+FROM com_reserva
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.3  VALUATION POR BRIEFING
+
+   Uma linha por briefing e cenário, com o saldo de entregas convertido pela
+   economia do próprio briefing. É a base da saída 12.3 e da soma que alimenta
+   o bloco E do resumo.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_10_briefing_valuation AS
+SELECT
+  c.grupo,
+  c.id_briefing,
+  c.ordem,
+  c.cenario,
+  e.n_campanhas,
+  e.n_envios,
+  e.n_entregues,
+  e.n_insucessos,
+  e.n_com_gr,
+  c.recuperadas,
+  c.perdidas,
+  c.recuperadas - c.perdidas                                          AS entregas_liquidas,
+  e.taxa_conversao,
+  e.ticket_medio,
+  e.origem_taxa,
+  e.origem_ticket,
+  e.n_entregues * e.taxa_conversao                                    AS conversoes_atuais,
+  e.n_entregues * e.taxa_conversao * e.ticket_medio                   AS receita_atual,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao                     AS conversoes_incrementais,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio    AS receita_incremental,
+  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio
+    / nullif(e.n_entregues * e.taxa_conversao * e.ticket_medio, 0)    AS crescimento_receita,
+  e.n_insucessos * e.custo_sms                                        AS custo_desperdicado,
+  (c.recuperadas - c.perdidas) * e.custo_sms                          AS midia_requalificada
+FROM vt_briefing_cenarios c
+JOIN vt_briefing_economia e ON c.grupo = e.grupo AND c.id_briefing = e.id_briefing
+;
+
+CREATE OR REPLACE TEMP VIEW vt_res_10_briefing_ranking AS
+WITH central AS (
+  SELECT *
+  FROM vt_res_10_briefing_valuation
+  WHERE cenario = 'CALIBRADO_CAMPANHA' AND receita_incremental > 0
+),
+ordenado AS (
+  SELECT
+    *,
+    row_number() OVER (PARTITION BY grupo ORDER BY receita_incremental DESC) AS posicao,
+    sum(receita_incremental) OVER (PARTITION BY grupo)                       AS total_positivo,
+    sum(receita_incremental) OVER (
+      PARTITION BY grupo ORDER BY receita_incremental DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)                      AS acumulado
+  FROM central
+)
+SELECT
+  *,
+  receita_incremental / nullif(total_positivo, 0) AS participacao,
+  acumulado / nullif(total_positivo, 0)           AS participacao_acumulada
+FROM ordenado
+;
+
+
+/* -----------------------------------------------------------------------------
+   10.4  AGREGADOS QUE ALIMENTAM O BLOCO E
+
+   Os campos mantêm os nomes da versão anterior. Onde antes havia uma taxa e
+   um tíquete únicos, passa a existir o valor efetivo, que é a média dos
+   briefings ponderada pelas entregas. Assim o bloco E do resumo não muda de
+   forma, apenas de conteúdo.
+----------------------------------------------------------------------------- */
+CREATE OR REPLACE TEMP VIEW vt_res_10_conversao_atual AS
+WITH soma AS (
+  SELECT
+    grupo,
+    sum(n_entregues)                                        AS entregas,
+    sum(n_entregues * taxa_conversao)                       AS conversoes_hoje,
+    sum(n_entregues * taxa_conversao * ticket_medio)        AS receita_hoje,
+    sum(n_com_gr / 100.0 * taxa_conversao * ticket_medio)   AS valor_por_ponto_percentual,
+    count(*)                                                AS briefings
+  FROM vt_briefing_economia
+  GROUP BY grupo
+)
+SELECT
+  s.grupo,
+  s.briefings,
+  s.conversoes_hoje / nullif(s.entregas, 0)               AS taxa_conversao,
+  s.receita_hoje / nullif(s.conversoes_hoje, 0)           AS valor_conversao,
+  s.receita_hoje / nullif(s.entregas, 0)                  AS valor_por_entrega,
+  s.conversoes_hoje,
+  s.receita_hoje,
+  s.receita_hoje / nullif(c.custo_total, 0)               AS retorno_por_real,
+  s.valor_por_ponto_percentual
+FROM soma s
+JOIN vt_res_09_custo_atual c ON s.grupo = c.grupo
 ;
 
 CREATE OR REPLACE TEMP VIEW vt_res_10_conversao_cenario AS
+WITH soma AS (
+  SELECT
+    grupo,
+    ordem,
+    cenario,
+    sum(entregas_liquidas)                                     AS entregas_liquidas,
+    sum(conversoes_incrementais)                               AS conversoes_incrementais,
+    sum(receita_incremental)                                   AS receita_incremental,
+    sum(CASE WHEN receita_incremental < 0 THEN 1 ELSE 0 END)   AS briefings_com_perda,
+    sum(CASE WHEN receita_incremental > 0 THEN receita_incremental ELSE 0 END) AS receita_ganha
+  FROM vt_res_10_briefing_valuation
+  GROUP BY grupo, ordem, cenario
+)
 SELECT
   s.grupo,
   s.ordem,
   s.cenario,
   s.entregas_liquidas,
-  s.pp_incremental,
-  a.valor_por_entrega,
-  s.entregas_liquidas * a.taxa_conversao                      AS conversoes_incrementais,
-  s.entregas_liquidas * a.valor_por_entrega                   AS receita_incremental,
-  s.entregas_liquidas * a.valor_por_entrega
-    / nullif(a.receita_hoje, 0)                               AS crescimento_sobre_receita_atual
-FROM vt_res_07_saldo s
+  s.entregas_liquidas / nullif(v.disparos_com_gr, 0)        AS pp_incremental,
+  s.receita_incremental / nullif(s.entregas_liquidas, 0)    AS valor_por_entrega,
+  s.conversoes_incrementais,
+  s.receita_incremental,
+  s.receita_incremental / nullif(a.receita_hoje, 0)         AS crescimento_sobre_receita_atual,
+  s.briefings_com_perda,
+  s.receita_ganha
+FROM soma s
+JOIN vt_res_04_volume v          ON s.grupo = v.grupo
 JOIN vt_res_10_conversao_atual a ON s.grupo = a.grupo
 ;
 
@@ -1498,11 +1719,10 @@ SELECT
   c.cenario,
   s.rotulo_taxa,
   s.rotulo_valor,
-  a.taxa_conversao  * s.mult_taxa                                   AS taxa_aplicada,
-  a.valor_conversao * s.mult_valor                                  AS ticket_aplicado,
+  a.taxa_conversao  * s.mult_taxa                       AS taxa_aplicada,
+  a.valor_conversao * s.mult_valor                      AS ticket_aplicado,
   c.entregas_liquidas,
-  c.entregas_liquidas * a.taxa_conversao * s.mult_taxa
-    * a.valor_conversao * s.mult_valor                              AS receita_incremental
+  c.receita_incremental * s.mult_taxa * s.mult_valor    AS receita_incremental
 FROM vt_res_10_conversao_cenario c
 JOIN vt_res_10_conversao_atual a ON c.grupo = a.grupo
 CROSS JOIN vt_param_sensibilidade s
@@ -2091,204 +2311,6 @@ JOIN (SELECT * FROM marcado WHERE rn_fim = 1) f ON i.grupo = f.grupo
 ;
 
 
-/* -----------------------------------------------------------------------------
-   11.13  VALUATION POR BRIEFING
-
-   Refaz o valuation no grão de briefing, usando a economia própria de cada um.
-   A lógica é a mesma da seção 07, aplicada dentro de cada briefing: quantos
-   insucessos teriam ido para outro número, quantos seriam recuperados em cada
-   cenário, quantos sucessos atuais ficariam em risco, e o saldo. A diferença é
-   que o saldo de cada briefing é convertido em receita pela taxa de conversão
-   e pelo tíquete daquele briefing, e não por uma premissa única.
-
-   O resultado responde a pergunta que a visão agregada não responde: onde,
-   exatamente, o Golden Record recupera receita, e quanto isso representa
-   sobre a receita atual de cada briefing.
-
-   POR QUE OS CINCO CENÁRIOS SÃO RECALCULADOS POR BRIEFING
-   Os ingredientes de cada cenário existem no grão de envio: o telefone
-   divergente, o desfecho, a taxa de calibração da própria campanha e o
-   histórico do telefone recomendado para aquele cliente. Agrupá-los por
-   briefing produz cenários coerentes com os da seção 07 e permite que a soma
-   dos briefings reconcilie com o total.
-
-   RECONCILIAÇÃO COM A VISÃO AGREGADA
-   Quando nenhum briefing tem parâmetro próprio, a soma por briefing coincide
-   com a estimativa da seção 10, porque todos usam a premissa geral. Quando há
-   parâmetros informados, as duas divergem, e a diferença mede o quanto a
-   premissa única estava distorcendo o valor. O resumo mostra essa diferença.
------------------------------------------------------------------------------ */
-CREATE OR REPLACE TEMP VIEW vt_briefing_volume AS
-SELECT
-  grupo,
-  id_briefing,
-  count(*)                    AS n_envios,
-  sum(entregue)               AS n_entregues,
-  count(DISTINCT campanha)    AS n_campanhas
-FROM vt_base_grupo
-GROUP BY grupo, id_briefing
-;
-
-CREATE OR REPLACE TEMP VIEW vt_briefing_economia AS
-SELECT
-  v.grupo,
-  v.id_briefing,
-  v.n_campanhas,
-  v.n_envios,
-  v.n_entregues,
-  v.n_envios - v.n_entregues                             AS n_insucessos,
-  coalesce(p.conversao_pct / 100.0,
-           p.conversoes_observadas / nullif(v.n_entregues, 0),
-           gp.taxa_conversao)                            AS taxa_conversao,
-  coalesce(p.ticket_medio, gp.valor_conversao)           AS ticket_medio,
-  CASE WHEN p.conversao_pct IS NOT NULL          THEN 'INFORMADA'
-       WHEN p.conversoes_observadas IS NOT NULL  THEN 'DERIVADA_DAS_CONVERSOES'
-       ELSE                                           'RESERVA_DO_GRUPO' END AS origem_taxa,
-  CASE WHEN p.ticket_medio IS NOT NULL THEN 'INFORMADO'
-       ELSE 'RESERVA_DO_GRUPO' END                      AS origem_ticket,
-  (p.id_briefing IS NOT NULL)                            AS parametrizado,
-  gp.custo_sms
-FROM vt_briefing_volume v
-LEFT JOIN vt_param_briefing p ON v.id_briefing = p.id_briefing
-JOIN vt_grupo_param gp          ON v.grupo = gp.grupo
-;
-
-CREATE OR REPLACE TEMP VIEW vt_briefing_cenarios AS
-WITH base AS (
-  SELECT
-    d.grupo,
-    d.id_briefing,
-    sum(CASE WHEN d.entregue = 0 THEN 1 ELSE 0 END)                                AS candidatos,
-    sum(CASE WHEN d.entregue = 0 THEN d.taxa_calibracao_campanha ELSE 0 END)       AS recup_calibrada,
-    max(d.taxa_concordante_global)                                                 AS taxa_global,
-    avg(CASE WHEN d.entregue = 0 AND d.evidencia_direta <> 'GR_NUNCA_ACIONADO'
-             THEN d.gr_taxa_entrega END)                                           AS taxa_hist_briefing,
-    sum(CASE WHEN d.entregue = 0 AND d.evidencia_direta = 'GR_ACIONADO_E_ENTREGOU'
-             THEN 1 ELSE 0 END)                                                    AS provada,
-    sum(CASE WHEN d.entregue = 1 THEN 1 ELSE 0 END)                                AS em_risco,
-    sum(CASE WHEN d.entregue = 1 THEN 1 - d.taxa_calibracao_campanha ELSE 0 END)   AS perda_calibrada,
-    sum(CASE WHEN d.entregue = 1 AND d.evidencia_direta = 'GR_ACIONADO_SEM_ENTREGA'
-             THEN 1 ELSE 0 END)                                                    AS perda_provada
-  FROM vt_envios_gr_diferente d
-  GROUP BY d.grupo, d.id_briefing
-),
-com_reserva AS (
-  SELECT b.*, coalesce(b.taxa_hist_briefing, ev.taxa_historica) AS taxa_hist
-  FROM base b
-  LEFT JOIN vt_res_07_evidencia ev ON b.grupo = ev.grupo
-)
-SELECT grupo, id_briefing, 1 AS ordem, 'TETO' AS cenario,
-       CAST(candidatos AS DOUBLE) AS recuperadas, CAST(0.0 AS DOUBLE) AS perdidas
-FROM com_reserva
-UNION ALL
-SELECT grupo, id_briefing, 2, 'CALIBRADO_GLOBAL',
-       candidatos * taxa_global, em_risco * (1 - taxa_global)
-FROM com_reserva
-UNION ALL
-SELECT grupo, id_briefing, 3, 'CALIBRADO_CAMPANHA',
-       recup_calibrada, perda_calibrada
-FROM com_reserva
-UNION ALL
-SELECT grupo, id_briefing, 4, 'EVIDENCIA_EXTRAPOLADA',
-       candidatos * taxa_hist, em_risco * (1 - taxa_hist)
-FROM com_reserva
-UNION ALL
-SELECT grupo, id_briefing, 5, 'PISO_OBSERVADO',
-       CAST(provada AS DOUBLE), CAST(perda_provada AS DOUBLE)
-FROM com_reserva
-;
-
-CREATE OR REPLACE TEMP VIEW vt_res_11_briefing_valuation AS
-SELECT
-  c.grupo,
-  c.id_briefing,
-  c.ordem,
-  c.cenario,
-  e.n_envios,
-  e.n_entregues,
-  e.n_insucessos,
-  c.recuperadas,
-  c.perdidas,
-  c.recuperadas - c.perdidas                                          AS entregas_liquidas,
-  e.taxa_conversao,
-  e.ticket_medio,
-  e.origem_taxa,
-  e.origem_ticket,
-  e.parametrizado,
-  e.n_entregues * e.taxa_conversao                                    AS conversoes_atuais,
-  e.n_entregues * e.taxa_conversao * e.ticket_medio                   AS receita_atual,
-  (c.recuperadas - c.perdidas) * e.taxa_conversao                     AS conversoes_incrementais,
-  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio    AS receita_incremental,
-  (c.recuperadas - c.perdidas) * e.taxa_conversao * e.ticket_medio
-    / nullif(e.n_entregues * e.taxa_conversao * e.ticket_medio, 0)    AS crescimento_receita,
-  e.n_insucessos * e.custo_sms                                        AS custo_desperdicado,
-  (c.recuperadas - c.perdidas) * e.custo_sms                          AS midia_requalificada
-FROM vt_briefing_cenarios c
-JOIN vt_briefing_economia e ON c.grupo = e.grupo AND c.id_briefing = e.id_briefing
-;
-
-CREATE OR REPLACE TEMP VIEW vt_res_11_briefing_agregado AS
-SELECT
-  grupo,
-  ordem,
-  cenario,
-  count(DISTINCT id_briefing)                                                AS briefings,
-  count(DISTINCT CASE WHEN parametrizado THEN id_briefing END)               AS briefings_parametrizados,
-  sum(receita_atual)                                                         AS receita_atual,
-  sum(entregas_liquidas)                                                     AS entregas_liquidas,
-  sum(conversoes_incrementais)                                               AS conversoes_incrementais,
-  sum(receita_incremental)                                                   AS receita_incremental,
-  sum(CASE WHEN parametrizado THEN receita_incremental ELSE 0 END)           AS receita_parametrizada,
-  sum(CASE WHEN receita_incremental > 0 THEN receita_incremental ELSE 0 END) AS receita_ganha,
-  sum(CASE WHEN receita_incremental < 0 THEN receita_incremental ELSE 0 END) AS receita_perdida,
-  sum(CASE WHEN receita_incremental < 0 THEN 1 ELSE 0 END)                   AS briefings_com_perda,
-  sum(receita_incremental) / nullif(sum(receita_atual), 0)                   AS crescimento_receita
-FROM vt_res_11_briefing_valuation
-GROUP BY grupo, ordem, cenario
-;
-
-CREATE OR REPLACE TEMP VIEW vt_res_11_briefing_ranking AS
-WITH central AS (
-  SELECT *
-  FROM vt_res_11_briefing_valuation
-  WHERE cenario = 'CALIBRADO_CAMPANHA' AND receita_incremental > 0
-),
-ordenado AS (
-  SELECT
-    *,
-    row_number() OVER (PARTITION BY grupo ORDER BY receita_incremental DESC)      AS posicao,
-    sum(receita_incremental) OVER (PARTITION BY grupo)                            AS total_positivo,
-    sum(receita_incremental) OVER (
-      PARTITION BY grupo ORDER BY receita_incremental DESC
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)                           AS acumulado
-  FROM central
-)
-SELECT
-  *,
-  receita_incremental / nullif(total_positivo, 0) AS participacao,
-  acumulado / nullif(total_positivo, 0)           AS participacao_acumulada
-FROM ordenado
-;
-
-CREATE OR REPLACE TEMP VIEW vt_res_11_briefing_concentracao AS
-SELECT
-  grupo,
-  count(*)                                                        AS briefings_com_ganho,
-  max(total_positivo)                                             AS receita_positiva_total,
-  min(CASE WHEN participacao_acumulada >= 0.5 THEN posicao END)   AS briefings_para_metade,
-  max(CASE WHEN posicao <= 10 THEN participacao_acumulada END)    AS participacao_dez_maiores,
-  max(CASE WHEN posicao = 1 THEN id_briefing END)                 AS maior_briefing,
-  max(CASE WHEN posicao = 1 THEN receita_incremental END)         AS receita_maior,
-  max(CASE WHEN posicao = 1 THEN crescimento_receita END)         AS crescimento_maior,
-  max(CASE WHEN posicao = 2 THEN id_briefing END)                 AS segundo_briefing,
-  max(CASE WHEN posicao = 2 THEN receita_incremental END)         AS receita_segundo,
-  max(CASE WHEN posicao = 3 THEN id_briefing END)                 AS terceiro_briefing,
-  max(CASE WHEN posicao = 3 THEN receita_incremental END)         AS receita_terceiro
-FROM vt_res_11_briefing_ranking
-GROUP BY grupo
-;
-
-
 /* =============================================================================
    SEÇÃO 12  RESUMO EXECUTIVO
    =============================================================================
@@ -2620,9 +2642,10 @@ FROM vt_res_09_custo_cenario cc WHERE cc.cenario = 'CALIBRADO_CAMPANHA'
 UNION ALL
 SELECT a.grupo, 'E. Valuation pela conversao', 50, 'Conversoes estimadas hoje',
   round(CAST(a.conversoes_hoje AS DOUBLE), 1), 'conversoes',
-  'Quantidade de conversoes que as entregas atuais geram, segundo a premissa comercial.',
-  concat('Entregas multiplicadas pela taxa de conversao de ', format_number(100.0 * a.taxa_conversao, 4), ' por cento.'),
-  'E a base de comparacao do bloco. Se a taxa de conversao adotada nao corresponder a realidade da operacao, todo este bloco se desloca proporcionalmente, mas o bloco D permanece valido.',
+  'Quantidade de conversoes que as entregas atuais geram, somando briefing a briefing com a taxa de cada um.',
+  concat('Soma, sobre ', format_number(a.briefings, 0), ' briefings, das entregas multiplicadas pela taxa de conversao do proprio briefing. A taxa efetiva resultante e de ',
+         format_number(100.0 * a.taxa_conversao, 4), ' por cento.'),
+  'E a base de comparacao do bloco. Cada briefing usa a taxa informada na secao 00.5, entao a conta nao depende de uma premissa unica. A taxa efetiva e apenas a media ponderada pelas entregas, e serve de referencia, nao de premissa.',
   concat('Cada entrega vale ', format_number(a.valor_por_entrega, 4),
          ' reais em valor esperado, combinando taxa e ticket.'),
   'vt_res_10_conversao_atual'
@@ -2631,8 +2654,9 @@ FROM vt_res_10_conversao_atual a
 UNION ALL
 SELECT a.grupo, 'E. Valuation pela conversao', 51, 'Receita estimada hoje',
   round(CAST(a.receita_hoje AS DOUBLE), 2), 'R$',
-  'Retorno gerado pelas entregas atuais, segundo a premissa comercial.',
-  concat('Conversoes estimadas multiplicadas pelo ticket de ', format_number(a.valor_conversao, 2), ' reais.'),
+  'Retorno gerado pelas entregas atuais, somando briefing a briefing com a taxa e o ticket de cada um.',
+  concat('Soma das conversoes de cada briefing multiplicadas pelo ticket do proprio briefing. O ticket efetivo resultante e de ',
+         format_number(a.valor_conversao, 2), ' reais.'),
   'Serve para dimensionar o ganho incremental em termos relativos, e nao apenas absolutos.',
   concat('Retorno atual de ', format_number(a.retorno_por_real, 2),
          ' reais para cada real investido em disparo.'),
@@ -2642,8 +2666,8 @@ FROM vt_res_10_conversao_atual a
 UNION ALL
 SELECT a.grupo, 'E. Valuation pela conversao', 52, 'Valor de cada ponto percentual de entrega',
   round(CAST(a.valor_por_ponto_percentual AS DOUBLE), 2), 'R$',
-  'Quanto vale, em receita, elevar em um ponto percentual a taxa de entrega da base coberta.',
-  'Um centesimo dos disparos com cobertura, multiplicado pelo valor esperado de cada entrega.',
+  'Quanto vale, em receita, elevar em um ponto percentual a taxa de entrega de todos os briefings do escopo.',
+  'Soma, sobre os briefings, de um centesimo dos disparos com cobertura do briefing multiplicado pela taxa e pelo ticket daquele briefing.',
   'E a regua para converter qualquer ganho de entrega em dinheiro sem refazer a conta. Multiplique este valor pela diferenca em pontos percentuais que se deseja avaliar.',
   'Aplique sobre a linha 13 para obter o valor do efeito medido com controle por campanha.',
   'vt_res_10_conversao_atual'
@@ -2653,8 +2677,8 @@ UNION ALL
 SELECT cv.grupo, 'E. Valuation pela conversao', 53 + cv.ordem,
   concat('Receita incremental, cenario ', cv.cenario),
   round(CAST(cv.receita_incremental AS DOUBLE), 2), 'R$',
-  'Retorno adicional gerado pelas entregas que hoje nao acontecem e passariam a acontecer.',
-  'Entregas liquidas do cenario multiplicadas pela taxa de conversao e pelo ticket medio.',
+  'Retorno adicional gerado pelas entregas que hoje nao acontecem e passariam a acontecer, somando briefing a briefing.',
+  'Para cada briefing, entregas recuperadas menos perdidas no cenario, multiplicadas pela taxa e pelo ticket daquele briefing. Depois, soma sobre os briefings.',
   CASE cv.cenario
     WHEN 'TETO' THEN 'Limite superior logico, nao previsao. Use para dizer que nem no melhor caso o ganho passaria deste valor.'
     WHEN 'CALIBRADO_GLOBAL' THEN 'Usa a taxa real do telefone recomendado na base inteira do grupo. Mais realista que o teto, porem mistura campanhas de naturezas distintas numa media unica.'
@@ -2664,7 +2688,9 @@ SELECT cv.grupo, 'E. Valuation pela conversao', 53 + cv.ordem,
   END,
   concat('Entregas liquidas de ', format_number(cv.entregas_liquidas, 0), ', equivalentes a ',
          format_number(cv.conversoes_incrementais, 1), ' conversoes e a ',
-         format_number(100.0 * cv.pp_incremental, 2), ' ponto percentual de entrega.'),
+         format_number(100.0 * cv.pp_incremental, 2), ' ponto percentual de entrega. ',
+         format_number(cv.briefings_com_perda, 0), ' briefings ficam com saldo negativo neste cenario; excluindo-os, o ganho seria de ',
+         format_number(cv.receita_ganha, 2), ' reais.'),
   'vt_res_10_conversao_cenario'
 FROM vt_res_10_conversao_cenario cv
 
@@ -2697,8 +2723,8 @@ UNION ALL
 SELECT sen.grupo, 'E. Valuation pela conversao', 63,
   'Receita incremental com metade da taxa de conversao',
   round(CAST(sen.receita_incremental AS DOUBLE), 2), 'R$',
-  'Cenario central recalculado com a taxa de conversao reduzida a metade e o ticket mantido.',
-  'Entregas liquidas do cenario central multiplicadas pela taxa reduzida e pelo ticket base.',
+  'Cenario central recalculado com a taxa de conversao de todos os briefings reduzida a metade e os tickets mantidos.',
+  'Receita incremental do cenario central multiplicada por meio, o que equivale a reduzir a taxa de cada briefing a metade.',
   'Mostra a sensibilidade do valuation a premissa comercial mais incerta. Se o projeto continua atrativo aqui, a decisao nao depende de acertar a taxa de conversao.',
   concat('Taxa aplicada de ', format_number(100.0 * sen.taxa_aplicada, 4), ' por cento.'),
   'vt_res_10_sensibilidade'
@@ -2710,8 +2736,8 @@ UNION ALL
 SELECT sen.grupo, 'E. Valuation pela conversao', 64,
   'Receita incremental com o dobro da taxa de conversao',
   round(CAST(sen.receita_incremental AS DOUBLE), 2), 'R$',
-  'Cenario central recalculado com a taxa de conversao dobrada e o ticket mantido.',
-  'Entregas liquidas do cenario central multiplicadas pela taxa dobrada e pelo ticket base.',
+  'Cenario central recalculado com a taxa de conversao de todos os briefings dobrada e os tickets mantidos.',
+  'Receita incremental do cenario central multiplicada por dois, o que equivale a dobrar a taxa de cada briefing.',
   'Completa a faixa de sensibilidade. A grade de nove combinacoes de taxa e ticket esta disponivel na view de origem.',
   concat('Taxa aplicada de ', format_number(100.0 * sen.taxa_aplicada, 4), ' por cento.'),
   'vt_res_10_sensibilidade'
@@ -3097,144 +3123,6 @@ SELECT pu.grupo, 'H. Evolucao ao longo dos meses', 98, 'Variacao da cobertura do
   'vt_res_11_primeiro_ultimo'
 FROM vt_res_11_primeiro_ultimo pu
 
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 100, 'Briefings analisados',
-  CAST(a.briefings AS DOUBLE), 'briefings',
-  'Quantidade de briefings distintos dentro do escopo, cada um com sua propria economia de conversao e ticket.',
-  'Contagem distinta de id_briefing na base de disparos valida.',
-  'E o grao em que a receita e recuperada. Cada briefing tem taxa de conversao e ticket proprios, entao a soma por briefing e mais precisa que qualquer premissa unica aplicada ao total.',
-  concat(format_number(a.briefings_parametrizados, 0), ' deles tem taxa e ticket informados na secao 00.5, e os demais usam a reserva do grupo.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 101, 'Briefings com economia propria informada',
-  round(CAST(100.0 * a.briefings_parametrizados / nullif(a.briefings, 0) AS DOUBLE), 4), '%',
-  'Fracao dos briefings para os quais a taxa de conversao e o ticket foram informados na secao 00.5.',
-  'Briefings presentes na tabela de parametros divididos pelo total de briefings do escopo.',
-  'Mede a precisao do bloco. So a parcela parametrizada tem economia de briefing, e o restante usa a premissa geral do grupo. Quanto maior este percentual, mais o valuation reflete a realidade de cada campanha e menos depende de uma media.',
-  'Priorize informar os briefings de maior volume de insucesso, porque sao eles que concentram o valor recuperavel.',
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 102, 'Receita atual estimada com a economia de cada briefing',
-  round(CAST(a.receita_atual AS DOUBLE), 2), 'R$',
-  'Retorno que as entregas atuais ja geram, calculado briefing a briefing com a taxa e o ticket de cada um.',
-  'Soma, sobre os briefings, das entregas atuais multiplicadas pela taxa de conversao e pelo ticket do briefing.',
-  'E a linha de base do bloco. Toda receita incremental deve ser lida como avanco a partir daqui. Compare com a linha 51, que usa premissa unica, para ver o quanto a economia por briefing muda a base.',
-  concat('Equivale a ', format_number(a.receita_atual / nullif(a.briefings, 0), 2), ' reais por briefing, em media.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 102 + a.ordem,
-  concat('Receita incremental anual por briefing, cenario ', a.cenario),
-  round(CAST(a.receita_incremental AS DOUBLE), 2), 'R$',
-  'Receita adicional que o Golden Record produziria, somando o saldo de cada briefing convertido pela economia daquele briefing.',
-  'Para cada briefing, entregas recuperadas menos perdidas, vezes a taxa de conversao e o ticket do briefing. Depois, soma sobre os briefings.',
-  CASE a.cenario
-    WHEN 'TETO' THEN 'Limite superior logico. Assume que todo insucesso com telefone divergente viraria entrega. Serve para dizer que nem no melhor caso o ganho passaria deste valor.'
-    WHEN 'CALIBRADO_GLOBAL' THEN 'Aplica a cada briefing a taxa de entrega do telefone recomendado medida na base inteira do grupo. Mais realista que o teto, mas ignora que cada campanha tem seu proprio patamar de entrega.'
-    WHEN 'CALIBRADO_CAMPANHA' THEN 'Cenario central. E o numero a usar no valuation. Cada briefing recebe a taxa de entrega do telefone recomendado medida dentro do proprio briefing, e a receita e calculada com a conversao e o ticket daquele briefing. Nenhuma premissa unica e aplicada ao total.'
-    WHEN 'EVIDENCIA_EXTRAPOLADA' THEN 'Cenario de estresse. Usa, em cada briefing, a taxa do telefone recomendado medida apenas entre clientes em que ele ja foi acionado, que e um subgrupo mais dificil. Costuma ficar abaixo dos demais e pode ser negativo. Descreve o subgrupo dificil, nao o desempenho esperado.'
-    ELSE 'Chao de seguranca. Conta em cada briefing apenas os casos em que o telefone recomendado ja foi acionado para o mesmo cliente e comprovadamente entregou, descontando perdas igualmente comprovadas. Nao extrapola nada.'
-  END,
-  concat('Sao ', format_number(a.entregas_liquidas, 0), ' entregas liquidas e ',
-         format_number(a.conversoes_incrementais, 1), ' conversoes adicionais, somadas sobre ',
-         format_number(a.briefings, 0), ' briefings.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 108, 'Crescimento da receita atual, cenario central',
-  round(CAST(100.0 * a.crescimento_receita AS DOUBLE), 4), '%',
-  'Quanto a receita incremental representa sobre a receita que as entregas atuais ja geram.',
-  'Receita incremental do cenario central dividida pela receita atual, ambas calculadas com a economia de cada briefing.',
-  'Traduz o ganho em termos relativos, que e a forma como uma diretoria compara iniciativas. Um crescimento de dois digitos sobre uma base de receita existente, sem novo investimento em midia, e um resultado raro para uma acao de dado.',
-  concat('A cada cem reais que o canal gera hoje, o Golden Record acrescentaria ',
-         format_number(100.0 * a.crescimento_receita, 2), ' reais.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 109, 'Parcela do ganho que vem de briefings com economia informada',
-  round(CAST(100.0 * a.receita_parametrizada / nullif(a.receita_incremental, 0) AS DOUBLE), 4), '%',
-  'Fracao da receita incremental do cenario central que foi calculada com taxa e ticket proprios do briefing, e nao com a reserva do grupo.',
-  'Receita incremental dos briefings parametrizados dividida pela receita incremental total.',
-  'Diz o quanto do numero final e preciso e o quanto e aproximado. Se esta fracao for baixa, o valor total ainda depende de uma media, e informar a economia dos maiores briefings e o passo mais barato para elevar a confianca do valuation.',
-  concat('Em reais: ', format_number(a.receita_parametrizada, 2), ' de ',
-         format_number(a.receita_incremental, 2), '.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 110, 'Diferenca entre a estimativa por briefing e a de premissa unica',
-  round(CAST(a.receita_incremental - g.receita_incremental AS DOUBLE), 2), 'R$',
-  'Quanto o valuation muda ao trocar uma taxa e um ticket unicos pela economia de cada briefing, no cenario central.',
-  'Receita incremental somada por briefing menos a receita incremental calculada com a premissa geral, ambas no cenario central.',
-  'Valor positivo significa que a premissa unica subestimava o ganho, porque os briefings de maior recuperacao tem economia acima da media. Valor negativo significa o contrario. Zero significa que nenhum briefing tem parametro proprio, e as duas contas coincidem por construcao.',
-  concat('Premissa unica: ', format_number(g.receita_incremental, 2), ' reais. Por briefing: ',
-         format_number(a.receita_incremental, 2), ' reais.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a
-JOIN vt_res_10_conversao_cenario g ON a.grupo = g.grupo AND a.cenario = g.cenario
-WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 111, 'Briefings em que o Golden Record reduziria a receita',
-  CAST(a.briefings_com_perda AS DOUBLE), 'briefings',
-  'Briefings cujo saldo liquido no cenario central e negativo, ou seja, em que a troca de telefone perderia mais entregas do que recuperaria.',
-  'Contagem de briefings com receita incremental negativa no cenario central.',
-  'E a lista de excecoes. Nesses briefings a adocao deve ser seletiva: manter o telefone atual onde ele ja entrega e usar o recomendado apenas nos insucessos. Excluir esses briefings da substituicao geral aumenta o ganho total.',
-  concat('A receita em risco nesses briefings soma ', format_number(abs(a.receita_perdida), 2),
-         ' reais, ja descontada do total da linha 105.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT a.grupo, 'I. Onde o Golden Record recupera receita', 112, 'Ganho se a adocao excluir os briefings com perda',
-  round(CAST(a.receita_ganha AS DOUBLE), 2), 'R$',
-  'Receita incremental do cenario central considerando apenas os briefings com saldo positivo.',
-  'Soma da receita incremental dos briefings em que ela e positiva.',
-  'E o ganho de uma adocao seletiva, que aplica o Golden Record so onde ele ajuda. Compare com a linha 105: a diferenca e o valor de ter a lista de excecoes em maos antes de implantar.',
-  concat('Contra ', format_number(a.receita_incremental, 2), ' reais da adocao indiscriminada.'),
-  'vt_res_11_briefing_agregado'
-FROM vt_res_11_briefing_agregado a WHERE a.cenario = 'CALIBRADO_CAMPANHA'
-
-UNION ALL
-SELECT c.grupo, 'I. Onde o Golden Record recupera receita', 113, 'Briefings que concentram metade do ganho',
-  CAST(c.briefings_para_metade AS DOUBLE), 'briefings',
-  'Quantidade de briefings necessarios, do maior para o menor, para acumular metade da receita incremental positiva.',
-  'Ordenacao dos briefings por receita incremental do cenario central, com soma acumulada ate cruzar metade do total positivo.',
-  'Define por onde comecar. Numero pequeno significa que um piloto dirigido a poucos briefings captura a maior parte do valor, com esforco muito menor que a adocao geral. E o argumento mais forte para uma implantacao em ondas.',
-  concat('De ', format_number(c.briefings_com_ganho, 0), ' briefings com ganho positivo.'),
-  'vt_res_11_briefing_concentracao'
-FROM vt_res_11_briefing_concentracao c
-
-UNION ALL
-SELECT c.grupo, 'I. Onde o Golden Record recupera receita', 114, 'Participacao dos dez maiores briefings no ganho',
-  round(CAST(100.0 * c.participacao_dez_maiores AS DOUBLE), 4), '%',
-  'Fracao da receita incremental positiva que vem dos dez briefings de maior ganho.',
-  'Soma acumulada da receita incremental dos dez primeiros briefings, dividida pelo total positivo.',
-  'Complementa a linha anterior. Participacao alta favorece comecar por esses briefings, medir o resultado e so depois generalizar.',
-  concat('Os tres maiores sao ', c.maior_briefing, ' com ', format_number(c.receita_maior, 2),
-         ' reais, ', c.segundo_briefing, ' com ', format_number(c.receita_segundo, 2),
-         ' reais e ', c.terceiro_briefing, ' com ', format_number(c.receita_terceiro, 2), ' reais.'),
-  'vt_res_11_briefing_concentracao'
-FROM vt_res_11_briefing_concentracao c
-
-UNION ALL
-SELECT c.grupo, 'I. Onde o Golden Record recupera receita', 115, 'Maior ganho em um unico briefing',
-  round(CAST(c.receita_maior AS DOUBLE), 2), 'R$',
-  'Receita incremental do briefing em que o Golden Record mais recupera, no cenario central.',
-  'Maior valor de receita incremental entre os briefings com saldo positivo.',
-  'E o candidato natural ao piloto, porque combina o maior retorno absoluto com a maior facilidade de medir resultado. A tabela detalhada por briefing, na saida 12.3, traz os demais na ordem.',
-  concat('Briefing ', c.maior_briefing, ', com crescimento de ',
-         format_number(100.0 * c.crescimento_maior, 2), ' por cento sobre a propria receita atual.'),
-  'vt_res_11_briefing_concentracao'
-FROM vt_res_11_briefing_concentracao c
-
 ;
 
 
@@ -3375,21 +3263,9 @@ WITH contexto AS (
       WHEN 96 THEN 'serie mensal da vantagem, reta ajustada por minimos quadrados'
       WHEN 97 THEN 'serie mensal da entrega sem o telefone recomendado, reta ajustada'
       WHEN 98 THEN 'todos os disparos, comparando o ultimo mes com o primeiro'
-      WHEN 100 THEN 'contagem absoluta, sem denominador'
-      WHEN 101 THEN 'todos os briefings do escopo'
-      WHEN 102 THEN 'entregas atuais, com a economia de cada briefing'
-      WHEN 108 THEN 'receita atual calculada com a economia de cada briefing'
-      WHEN 109 THEN 'receita incremental total do cenario central'
-      WHEN 110 THEN 'diferenca entre as duas formas de calcular o cenario central'
-      WHEN 111 THEN 'contagem absoluta, sem denominador'
-      WHEN 112 THEN 'briefings com saldo positivo no cenario central'
-      WHEN 113 THEN 'briefings com saldo positivo no cenario central'
-      WHEN 114 THEN 'receita incremental positiva de todos os briefings'
-      WHEN 115 THEN 'briefing de maior receita incremental'
       ELSE CASE
         WHEN r.ordem BETWEEN 37 AND 41 THEN 'entregas liquidas do cenario'
         WHEN r.ordem BETWEEN 54 AND 58 THEN 'entregas liquidas do cenario'
-        WHEN r.ordem BETWEEN 103 AND 107 THEN 'entregas liquidas do cenario, somadas briefing a briefing'
         ELSE 'contagem absoluta, sem denominador'
       END
     END                                                      AS base_de_calculo,
@@ -3492,8 +3368,8 @@ SELECT
   r.posicao,
   round(CAST(100.0 * r.participacao AS DOUBLE), 4)             AS participacao_pct,
   round(CAST(100.0 * r.participacao_acumulada AS DOUBLE), 4)   AS participacao_acumulada_pct
-FROM vt_res_11_briefing_valuation v
-LEFT JOIN vt_res_11_briefing_ranking r
+FROM vt_res_10_briefing_valuation v
+LEFT JOIN vt_res_10_briefing_ranking r
   ON v.grupo = r.grupo AND v.id_briefing = r.id_briefing
 WHERE v.cenario = 'CALIBRADO_CAMPANHA'
 ORDER BY v.grupo, v.receita_incremental DESC
